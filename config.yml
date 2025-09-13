@@ -1,0 +1,17 @@
+telegram:
+  bot_token: "8353828354:AAGiE8J8qv4NquTtvIAMwzjr1YVGQQZYeDM"
+  chat_id: "1032339286"
+fred:
+  api_key: "d63cc00a6f9a9b88680e7a15387e3b77"
+av: 
+  api_key: "871DV2SJQY1QOVRK"
+fmp: 
+  api_key: "LC1wu7ZmK3FrBhlbYxxVLZJydKS6p1rd"
+finn:
+  api_key: "d31148hr01qnu2r02pdgd31148hr01qnu2r02pe0"
+gateway:
+  path: "C:\\Users\\zorlo\\ibkr\\ClientPortal.gw"
+  run_script: "bin\\run.bat"
+  wait_time_seconds: 5
+  login_url: "https://localhost:5000"
+
