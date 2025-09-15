@@ -10,8 +10,9 @@ if sys.platform.startswith("win"):
 pages = {
     "Home": "app_pages.home",
     "ETF Momentum": "app_pages.etf_momentum",
-    # add more pages here
+    "Earnings Position": "app_pages.earnings_positions",  # new page added here
 }
+
 
 st.sidebar.title("Navigation")
 page_choice = st.sidebar.selectbox("Go to", list(pages.keys()))
