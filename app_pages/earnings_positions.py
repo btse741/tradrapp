@@ -30,7 +30,7 @@ def run():
     </style>
     """, unsafe_allow_html=True)
     
-    stock_input = st.text_input("Enter Stock Symbol:", max_chars=10, key="stock_input")
+    stock_input = st.text_input("Enter Stock Symbol:", max_chars=6, key="stock_input")
 
     if st.button("Submit"):
         if not stock_input.strip():

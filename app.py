@@ -9,13 +9,14 @@ if sys.platform.startswith("win"):
 # Define pages dictionary as module path strings
 pages = {
     "Home": "app_pages.home",
-    "ETF Momentum": "app_pages.etf_momentum",
-    "Earnings Position": "app_pages.earnings_positions",  # new page added here
+    "ETF Rotations": "app_pages.etf_momentum",
+    "Preannouncement Options Strategy": "app_pages.earnings_positions", 
+     "Intraday Triggers": "app_pages.gamma_flip_page" # new page added here
 }
 
-
-st.sidebar.title("Navigation")
-page_choice = st.sidebar.selectbox("Go to", list(pages.keys()))
+st.sidebar.title("Models")
+# Use radio buttons to show all pages in sidebar for quick access
+page_choice = st.sidebar.radio("Go to", list(pages.keys()))
 
 # Dynamically import selected page module and run its `run()` function
 page_module = import_module(pages[page_choice])

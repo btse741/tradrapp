@@ -9,4 +9,9 @@ COPY . /app
 
 RUN mkdir -p /app/data /app/output
 
-CMD ["python", "models/etf_momentum/data_update.py"]
+# Copy and set permissions for the run_all.sh script
+COPY run_all.sh /app/
+RUN chmod +x /app/run_all.sh
+
+# Run the shell script to execute both Python scripts sequentially
+CMD ["/app/run_all.sh"]
