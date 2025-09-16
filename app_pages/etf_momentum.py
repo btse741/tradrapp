@@ -19,21 +19,24 @@ def get_latest_file_mtime(filepaths):
 
 
 def data_is_fresh():
-    output_files = [
-        os.path.join(PROJECT_ROOT, "output", "strategy_performance_table.jpg"),
-        os.path.join(PROJECT_ROOT, "output", "cumulative_12m_performance.png"),
-    ]
-    latest_mtime = get_latest_file_mtime(output_files)
-    if not latest_mtime:
+    last_update_file = os.path.join(PROJECT_ROOT, "data","etf_momentum_last_update.txt")
+    if not os.path.exists(last_update_file):
         return False
-    last_modified = datetime.datetime.fromtimestamp(latest_mtime).date()
+    
+    with open(last_update_file, "r") as f:
+        last_update_str = f.read().strip()
+    try:
+        last_update_date = datetime.strptime(last_update_str, "%Y-%m-%d").date()
+    except Exception:
+        return False
+
     today = datetime.date.today()
     weekday = today.weekday()
     if weekday >= 5:
         friday = today - datetime.timedelta(days=(weekday - 4))
-        return last_modified >= friday
+        return last_update_date >= friday
     else:
-        return last_modified >= today
+        return last_update_date >= today
 
 
 @st.cache_data(ttl=3600)

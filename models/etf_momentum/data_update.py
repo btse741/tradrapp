@@ -5,12 +5,8 @@ from datetime import datetime
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 DATA_FOLDER = os.path.join(PROJECT_ROOT, 'data')
-OUTPUT_FOLDER = os.path.join(PROJECT_ROOT, 'output')
-
 
 os.makedirs(DATA_FOLDER, exist_ok=True)
-os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-
 
 strat1_etf = ["SPY", "EFA", "AGG", "VNQ", "GSG",
               "FXE", "EEM", "GLD", "TIP", "LQD",
@@ -19,7 +15,6 @@ strat2_etf = ["DGRW", "GGRW", "DON", "DES", "DEM", "DTH", "DHS"]
 strat3_etf = ["SPY", "VOO", "IVV", "EEM", "VTI", "TDVG", "VT", "FBND", "AOA", "AOR"]
 strat4_etf = ["XLK", "XLF", "XLE", "XLV", "XLY", "XLP", "XLU", "XLI", "XLB", "XLRE"]
 strat5_etf = list(set(strat1_etf + strat3_etf + strat4_etf))
-
 
 DL_list = {
     "strat1_etf": strat1_etf,
@@ -31,7 +26,6 @@ DL_list = {
 
 from_date = "2000-01-01"
 to_date = datetime.today().strftime("%Y-%m-%d")
-
 
 def download_adjusted_prices(symbols, filename, progress_callback=None, progress_start=0, progress_end=100):
     data = yf.download(symbols, start=from_date, end=to_date, group_by='ticker', auto_adjust=True)
