@@ -29,9 +29,9 @@ def load_prices():
     return prices
 
 def calc_blended_momentum_daily(prices):
-    mom_3m = prices.pct_change(MOMENTUM_DAYS_3).shift(20).dropna(how='all')
-    mom_6m = prices.pct_change(MOMENTUM_DAYS_6).shift(20).dropna(how='all')
-    mom_12m = prices.pct_change(MOMENTUM_DAYS_12).shift(20).dropna(how='all')
+    mom_3m = prices.pct_change(MOMENTUM_DAYS_3, fill_method=None).shift(20).dropna(how='all')
+    mom_6m = prices.pct_change(MOMENTUM_DAYS_6, fill_method=None).shift(20).dropna(how='all')
+    mom_12m = prices.pct_change(MOMENTUM_DAYS_12, fill_method=None).shift(20).dropna(how='all')
 
     def standardize(df):
         return (df - df.mean(axis=1).values[:, None]) / df.std(axis=1).values[:, None]
@@ -62,14 +62,14 @@ def clenow_momentum(prices, window=CLENOW_WINDOW_DAYS):
     return clenow_scores
 
 def calc_annualized_volatility(prices, window=60):
-    daily_ret = prices.pct_change().dropna()
+    daily_ret = prices.pct_change(fill_method=None).dropna()
     rolling_vol = daily_ret.rolling(window=window).std() * np.sqrt(TRADING_DAYS_PER_YEAR)
     return rolling_vol
 
 def calc_carver_momentum(prices):
-    mom_3m = prices.pct_change(MOMENTUM_DAYS_3)
-    mom_6m = prices.pct_change(MOMENTUM_DAYS_6)
-    mom_12m = prices.pct_change(MOMENTUM_DAYS_12)
+    mom_3m = prices.pct_change(MOMENTUM_DAYS_3, fill_method=None)
+    mom_6m = prices.pct_change(MOMENTUM_DAYS_6, fill_method=None)
+    mom_12m = prices.pct_change(MOMENTUM_DAYS_12, fill_method=None)
 
     vol_3m = calc_annualized_volatility(prices, window=MOMENTUM_DAYS_3).replace(0, np.nan)
     vol_6m = calc_annualized_volatility(prices, window=MOMENTUM_DAYS_6).replace(0, np.nan)
@@ -137,7 +137,7 @@ def run_daily_with_monthly_signal_equal_weight(
     progress_callback=None):
 
     prices = load_prices()
-    daily_returns = prices.pct_change().dropna()
+    daily_returns = prices.pct_change(fill_method=None).dropna()
     daily_returns_aligned, _ = daily_returns.align(prices, join='inner', axis=0)
 
     portfolio_returns = []
@@ -282,7 +282,7 @@ def run_all(progress_callback=None):
         progress_callback=None
     )
 
-    daily_returns = prices.pct_change().dropna()
+    daily_returns = prices.pct_change(fill_method=None).dropna()
     spy_daily_returns = daily_returns['SPY'].dropna()
     spy_cum_returns = (1 + spy_daily_returns).cumprod() - 1
 

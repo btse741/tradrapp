@@ -1,0 +1,30 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Distribution / packaging
+.env
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Git files
+.git
+.gitignore
+
+# Tests
+tests/
+
+# Documentation
+*.md
+
+# Logs
+logs/
+*.log
+
+# Sensitive or large data (not to include in image build)
+stockdata/

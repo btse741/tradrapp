@@ -1,13 +1,9 @@
 Strategy,ETF,Action,Weight Change,Current Position
-Carver,EEM,Hold/Adjust,-0.0833333333333334,0.25
-Carver,FXE,Buy,0.1666666666666666,0.0
-Carver,GLD,Buy,0.1666666666666666,0.0
-Carver,HYG,Hold/Adjust,-0.0833333333333334,0.25
-Carver,LQD,Hold/Adjust,-0.010000000000000002,-0.04
-Carver,SPY,Buy,0.1666666666666666,0.0
-Carver,TIP,Hold/Adjust,-0.0833333333333334,0.25
-Carver,UNG,Hold/Adjust,-0.010000000000000002,-0.04
-Carver,USO,Hold/Adjust,-0.010000000000000002,-0.04
-Carver,VNQ,Hold/Adjust,-0.010000000000000002,-0.04
-Carver,GSG,Cover,0.04,-0.04
+Blended,AGG,Cover,0.05,-0.05
+Blended,GSG,Sell Short,-0.05,0.0
+Carver,EEM,Hold/Adjust,-0.04999999999999999,0.25
+Carver,GLD,Buy,0.2,0.0
+Carver,HYG,Hold/Adjust,-0.04999999999999999,0.25
+Carver,SPY,Buy,0.2,0.0
+Carver,TIP,Hold/Adjust,-0.04999999999999999,0.25
 Carver,QQQ,Sell,-0.25,0.25

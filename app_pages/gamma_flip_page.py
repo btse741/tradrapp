@@ -10,7 +10,6 @@ from streamlit_autorefresh import st_autorefresh
 
 st_autorefresh(interval=60000, key="datarefresh")
 
-
 # Set project root and data/output folders
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 DATA_FOLDER = os.path.join(PROJECT_ROOT, 'data')
@@ -31,7 +30,7 @@ os.makedirs(DATA_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=60)
 def load_latest_etf_candles(ticker, days=5):
     url = "https://www.alphavantage.co/query"
     params = {

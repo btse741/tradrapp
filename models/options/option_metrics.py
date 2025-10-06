@@ -1,10 +1,82 @@
 import yfinance as yf
+import psycopg2
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-import os
 from scipy.stats import norm
 from scipy.optimize import brentq
+import yaml
+from sqlalchemy import create_engine
+import os
+import sys
+print("sys.path:", sys.path)
+print("cwd:", os.getcwd())
+
+from utils.trading_calendar import (
+    is_trading_day,
+    next_trading_day,
+    last_trading_day_of_week,
+    last_trading_day_of_month,
+    find_expiry_within_trading_days
+)
+
+# Setup project paths and config
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..','..'))
+print(project_root)
+config_path = os.path.join(project_root, 'config.yml')
+data_folder = os.path.join(project_root, 'data', 'sf_data')
+
+with open(config_path, 'r') as f:
+    config = yaml.safe_load(f)
+
+params = config['database']
+api_key = config['simfin']['api_key']
+
+def create_engine_db():
+    connection_string = (
+        f"postgresql+psycopg2://{params['user']}:{params['password']}"
+        f"@{params['host']}:{params['port']}/{params['dbname']}"
+    )
+    engine = create_engine(connection_string)
+    return engine
+
+def connect_db():
+    print("Connecting to PostgreSQL database...")
+    conn = psycopg2.connect(
+        dbname=params['dbname'],
+        user=params['user'],
+        password=params['password'],
+        host=params['host'],
+        port=params['port']
+    )
+    conn.set_client_encoding('UTF8')
+    print("Database connection established.")
+    return conn
+
+def insert_option_metrics(conn, result_dict):
+    with conn.cursor() as cur:
+        insert_query = """
+            INSERT INTO option_metrics (
+                symbol, date, gamma_flip_line, underlying_price,
+                day_ahead_high, day_ahead_low,
+                wk_ahead_high, wk_ahead_low,
+                mth_ahead_high, mth_ahead_low
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """
+        cur.execute(insert_query, (
+            result_dict['symbol'],
+            result_dict['date'],
+            result_dict['gamma_flip_line'],
+            result_dict['underlying_price'],
+            result_dict.get('1_day_ahead_high'),
+            result_dict.get('1_day_ahead_low'),
+            result_dict.get('1_wk_ahead_high'),
+            result_dict.get('1_wk_ahead_low'),
+            result_dict.get('1_mth_ahead_high'),
+            result_dict.get('1_mth_ahead_low'),
+        ))
+    conn.commit()
 
 def black_scholes_gamma(S, K, T, r, sigma):
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
@@ -42,11 +114,34 @@ def filter_strikes_by_oi_and_atm(df_opt, underlying_price, top_n_strikes=20):
     df_filtered = df_filtered.sort_values(by='atm_distance')
     return df_filtered.drop(columns=['atm_distance'])
 
-def compute_expected_move(underlying_price, iv, days_to_expiry):
+def get_atm_iv(df_opt, underlying_price):
+    # Find the ATM strike closest to underlying price
+    strikes = df_opt['strike'].unique()
+    atm_strike = min(strikes, key=lambda x: abs(x - underlying_price))
+    atm_options = df_opt[df_opt['strike'] == atm_strike].copy()
+    iv_call = atm_options[atm_options['optionType'] == 'call']['impliedVolatility']
+    oi_call = atm_options[atm_options['optionType'] == 'call']['openInterest']
+    iv_put = atm_options[atm_options['optionType'] == 'put']['impliedVolatility']
+    oi_put = atm_options[atm_options['optionType'] == 'put']['openInterest']
+    iv_calls = np.average(iv_call, weights=oi_call) if len(iv_call) > 0 and oi_call.sum() > 0 else np.nan
+    iv_puts = np.average(iv_put, weights=oi_put) if len(iv_put) > 0 and oi_put.sum() > 0 else np.nan
+    if not np.isnan(iv_calls) and not np.isnan(iv_puts):
+        atm_iv = (iv_calls + iv_puts) / 2
+    elif not np.isnan(iv_calls):
+        atm_iv = iv_calls
+    elif not np.isnan(iv_puts):
+        atm_iv = iv_puts
+    else:
+        atm_iv = np.nan
+    return atm_iv
+
+def compute_expected_move_asymmetric(underlying_price, atm_iv, days_to_expiry):
     T = days_to_expiry / 365
-    if iv == 0 or T <= 0:
-        return 0
-    return underlying_price * iv * np.sqrt(T)
+    if np.isnan(atm_iv) or atm_iv == 0 or T <= 0:
+        return (0, 0)
+    up_move = underlying_price * (np.exp(atm_iv * np.sqrt(T)) - 1)
+    down_move = underlying_price * (1 - np.exp(-atm_iv * np.sqrt(T)))
+    return (up_move, down_move)
 
 def net_gamma_exposure(S, df_opt, r):
     total_gamma_exp = 0.0
@@ -57,7 +152,7 @@ def net_gamma_exposure(S, df_opt, r):
         oi = row['openInterest']
         option_type = row['optionType']
         gamma = black_scholes_gamma(S, K, T, r, sigma)
-        gamma_exp = gamma * oi * 100  # contracts * contract size
+        gamma_exp = gamma * oi * 100
         if option_type == 'put':
             gamma_exp = -gamma_exp
         total_gamma_exp += gamma_exp
@@ -79,34 +174,43 @@ def process_ticker_wrapper(ticker, as_of_date):
     if not expirations:
         print(f"No expirations found for {ticker}")
         return None
-    expirations_dt = [datetime.strptime(d, "%Y-%m-%d") for d in expirations]
-    dte_dict = {d: (d - as_of_date).days for d in expirations_dt}
-
+    expirations_dt = [datetime.strptime(d, "%Y-%m-%d").date() for d in expirations]
+    dte_dict = {d: (d - as_of_date.date()).days for d in expirations_dt}
     history = tk.history(period='1d')
     if history.empty:
         print(f"No price history for {ticker}")
         return None
     underlying_price = history['Close'].iloc[0]
 
-    one_day_expiries = [d for d in expirations_dt if 0 < dte_dict[d] <= 5]
-    one_week_expiries = [d for d in expirations_dt if 5 < dte_dict[d] <= 9]
-    one_month_expiries = [d for d in expirations_dt if 20 <= dte_dict[d] <= 30]
+    as_of_date_only = as_of_date.date()
 
-    def select_expiry_with_highest_oi(expiry_list):
-        max_oi = -1
-        chosen_exp = None
-        for exp in expiry_list:
-            opt_df = fetch_option_chain(ticker, exp.strftime("%Y-%m-%d"))
-            opt_df = opt_df.dropna(subset=['openInterest'])
-            oi_sum = opt_df['openInterest'].sum() if not opt_df.empty else 0
-            if oi_sum > max_oi:
-                max_oi = oi_sum
-                chosen_exp = exp
-        return chosen_exp
+    # 1-day ahead expiry: find next trading day then expiry within next 5 trading days
+    start_1d = next_trading_day(as_of_date_only)
+    selected_1d = find_expiry_within_trading_days(expirations_dt, start_1d, 5)
 
-    selected_1d = select_expiry_with_highest_oi(one_day_expiries)
-    selected_1w = select_expiry_with_highest_oi(one_week_expiries)
-    selected_1m = select_expiry_with_highest_oi(one_month_expiries)
+    # 1-week ahead expiry: check calendar days +7 to +10
+    selected_1w = None
+    for offset in range(7, 11):
+        candidate = as_of_date_only + timedelta(days=offset)
+        if candidate in expirations_dt:
+            selected_1w = candidate
+            break
+
+    # 1-month ahead expiry: check calendar days +30 to +35
+    selected_1m = None
+    for offset in range(30, 36):
+        candidate = as_of_date_only + timedelta(days=offset)
+        if candidate in expirations_dt:
+            selected_1m = candidate
+            break
+
+    # Only update week ahead if last trading day of week
+    if not last_trading_day_of_week(as_of_date_only):
+        selected_1w = None
+
+    # Only update month ahead if last trading day of month
+    if not last_trading_day_of_month(as_of_date_only):
+        selected_1m = None
 
     expected_ranges = {
         '1_day_ahead_high': np.nan,
@@ -125,27 +229,26 @@ def process_ticker_wrapper(ticker, as_of_date):
             return
         dte = dte_dict[expiry]
         df_opt = fetch_option_chain(ticker, expiry.strftime("%Y-%m-%d"))
-        df_filtered = filter_strikes_by_oi_and_atm(df_opt, underlying_price, top_n_strikes=20)
+        df_filtered = filter_strikes_by_oi_and_atm(df_opt, underlying_price, top_n_strikes=40)
         if df_filtered.empty:
             print(f"No valid options data for expiry {expiry.strftime('%Y-%m-%d')}")
             return
-        iv_values = df_filtered['impliedVolatility'].dropna()
-        weights = df_filtered['openInterest'].dropna()
-        if weights.sum() == 0 or len(weights) == 0:
-            iv_weighted_avg = iv_values.mean() if len(iv_values) > 0 else 0
-        else:
-            iv_weighted_avg = np.average(iv_values, weights=weights)
-        expected_move = compute_expected_move(underlying_price, iv_weighted_avg, dte)
-        expected_ranges[f'{label_prefix}_high'] = underlying_price + expected_move
-        expected_ranges[f'{label_prefix}_low'] = underlying_price - expected_move
-        print(f"{label_prefix}: expiry={expiry.strftime('%Y-%m-%d')}, DTE={dte}, IV_avg={iv_weighted_avg:.4f}, Expected Move={expected_move:.4f}")
+        atm_iv = get_atm_iv(df_filtered, underlying_price)
+        up_move, down_move = compute_expected_move_asymmetric(underlying_price, atm_iv, dte)
+        expected_ranges[f'{label_prefix}_high'] = underlying_price + up_move
+        expected_ranges[f'{label_prefix}_low'] = underlying_price - down_move
+        print(f"{label_prefix}: expiry={expiry.strftime('%Y-%m-%d')}, DTE={dte}, ATM_IV={atm_iv:.4f}, Up Move={up_move:.4f}, Down Move={down_move:.4f}")
 
     process_expected_move(selected_1d, '1_day_ahead')
     process_expected_move(selected_1w, '1_wk_ahead')
     process_expected_move(selected_1m, '1_mth_ahead')
 
-    # Gather aggregated data for gamma flip calculation
-    all_expiries_for_gamma = sorted(set(one_day_expiries + one_week_expiries + one_month_expiries))
+    all_expiries_for_gamma = sorted(set(
+        [d for d in expirations_dt if 1 <= dte_dict[d] <= 3] +
+        [d for d in expirations_dt if 5 <= dte_dict[d] <= 7] +
+        [d for d in expirations_dt if 20 <= dte_dict[d] <= 24]
+    ))
+
     df_gamma = pd.DataFrame()
     for exp in all_expiries_for_gamma:
         df_opt = fetch_option_chain(ticker, exp.strftime("%Y-%m-%d"))
@@ -168,5 +271,16 @@ def process_ticker_wrapper(ticker, as_of_date):
 
 if __name__ == "__main__":
     today = datetime.now()
-    r = process_ticker_wrapper("SPY", today)
-    print(r)
+    conn = None
+    try:
+        result = process_ticker_wrapper("SPY", today)
+        print(result)
+        if result:
+            conn = connect_db()
+            insert_option_metrics(conn, result)
+            print("Result saved to PostgreSQL database.")
+    except Exception as e:
+        print("Error:", e)
+    finally:
+        if conn:
+            conn.close()

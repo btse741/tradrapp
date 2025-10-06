@@ -12,3 +12,6 @@ env/
 venv/
 Dockerfile
 run_all.sh
+stockdata/
+data/
+r_scripts/
