@@ -24,15 +24,17 @@ run_r_script() {
   fi
 }
 
+# Change working dir to where config.yml is located
+cd /app || exit 1
+
 # Run Python scripts
 run_python_script "$ROOT_DIR/update_etf_data.py"
 run_python_script "$ROOT_DIR/option_metrics_new.py"
 run_python_script "$ROOT_DIR/stockdata/db_price_update_r.py"
 run_python_script "$ROOT_DIR/stockdata/sp500_update.py"
 
-# Run R script for corporate action update
-run_r_script "$ROOT_DIR/r_scripts/update_corporate_action.R"
-# Run R script for fundamentals
-run_r_script "$ROOT_DIR/r_scripts/update_fundamentals.R"
+# Run R scripts (paths relative to current dir now)
+run_r_script "r_scripts/update_corporate_action.R"
+run_r_script "r_scripts/update_fundamentals.R"
 
 echo "All scripts finished running."

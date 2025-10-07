@@ -284,17 +284,10 @@ def process_ticker_wrapper(ticker, as_of_date):
     start_1d = next_trading_day(as_of_date_only)
     selected_1d = find_closest_expiry_in_range(expirations_dt, start_1d, 0, 5)
 
-    selected_1w = None
-    if last_trading_day_of_week(as_of_date_only):
-        selected_1w = find_closest_expiry_in_range(expirations_dt, as_of_date_only + timedelta(days=7), 0, 3)
-
-    selected_1m = None
-    if last_trading_day_of_month(as_of_date_only):
-        selected_1m = find_closest_expiry_in_range(expirations_dt, as_of_date_only + timedelta(days=30), 20, 60)
-
-    selected_1q = None
-    if last_trading_day_of_quarter(as_of_date_only):
-        selected_1q = find_closest_expiry_in_range(expirations_dt, as_of_date_only + timedelta(days=90), 70, 130)
+    # Updated: no last trading day condition, expanded search ranges
+    selected_1w = find_closest_expiry_in_range(expirations_dt, as_of_date_only + timedelta(days=7), 4, 14)
+    selected_1m = find_closest_expiry_in_range(expirations_dt, as_of_date_only + timedelta(days=30), 20, 45)
+    selected_1q = find_closest_expiry_in_range(expirations_dt, as_of_date_only + timedelta(days=90), 60, 110)
 
     expected_ranges = {
         '1_day_ahead_high': np.nan,
