@@ -38,6 +38,7 @@ run_r_script "r_scripts/update_corporate_action.R"
 run_r_script "r_scripts/update_fundamentals.R"
 
 # Update raw indicators into monthly
-run_python_script "$ROOT_DIR/factor_model/factor_build.py"
+run_python_script "$ROOT_DIR/factor_model/price_factors.py"
+run_python_script "$ROOT_DIR/factor_model/fundamental_factors.py"
 
 echo "All scripts finished running."
