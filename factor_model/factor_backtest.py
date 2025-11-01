@@ -1,5 +1,5 @@
 import pandas as pd
-from datetime import timedelta
+from datetime import timedelta, datetime
 
 def backtest_factor_model(conn, engine, start_date, end_date, factors_to_score, holding_period_days=21):
     monthly_dates = get_monthly_eom_dates(start_date, end_date)

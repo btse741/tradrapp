@@ -1,4 +1,5 @@
 import os
+import sys
 import yaml
 import psycopg2
 import psycopg2.extras
@@ -77,21 +78,21 @@ indicators = [
         'sector': 'nonfinancials',
         'type': 'flow',
         'income_table': 'cashflow_qtr_nonfinancials',
-        'factor_name': 'ttm_dvd'
+        'factor_name': 'ttm_div'
     },
     {
         'name': 'dividends_paid',
         'sector': 'banks',
         'type': 'flow',
         'income_table': 'cashflow_qtr_banks',
-        'factor_name': 'ttm_dvd'
+        'factor_name': 'ttm_div'
     },
     {
         'name': 'dividends_paid',
         'sector': 'insurance',
         'type': 'flow',
         'income_table': 'cashflow_qtr_insurance',
-        'factor_name': 'ttm_dvd'
+        'factor_name': 'ttm_div'
     },
     {
         'name': 'net_cash_from_operating_activities',
@@ -430,7 +431,7 @@ def decide_mode(today=None):
     else:
         month_change_day = yesterday
 
-    if (month_change_day.month == 1 or month_change_day.month == 7) and 1 <= month_change_day.day <= 7:
+    if (month_change_day.month == 1 or month_change_day.month == 7) and month_change_day.weekday() == 4 and 1 <= month_change_day.day <= 7:
         return "full"
 
     return "incremental"
@@ -599,8 +600,9 @@ def compute_and_upsert_extended_factors(conn, factor_date, engine, indicators):
             invested_capital_nf = working_capital - row['cash_and_equiv'] + row['net_fixed_assets']
 
         invested_capital_f = None
-        if None not in (row['total_equity_last'], row['preferred_equity_last']):
-            invested_capital_f = row['total_equity_last'] - row['preferred_equity_last']
+        if row['total_equity_last'] is not None: 
+            preferred = row['preferred_equity_last'] or 0 
+            invested_capital_f = row['total_equity_last'] - preferred
 
         invested_capital = invested_capital_nf or invested_capital_f
 
@@ -635,12 +637,14 @@ def compute_and_upsert_extended_factors(conn, factor_date, engine, indicators):
         if row['ttm_div'] is not None and market_cap not in (None, 0):
             div_yield = safe_div(row['ttm_div'], market_cap)
 
-        debt_to_equity = None
         long_term = row['long_term_debt'] or 0
         short_term = row['short_term_debt'] or 0
-        total_equity_last = row['total_equity_last']
+        total_equity_last = row['total_equity_last'] or 0
+        cash = row['cash_and_equiv'] or 0
         if total_equity_last not in (None, 0):
-            debt_to_equity = safe_div(long_term + short_term, total_equity_last)
+            debt_to_equity = safe_div(long_term + short_term - cash, total_equity_last)
+        else:
+            debt_to_equity = None
 
         roic = None
         if row['ttm_ebit'] is not None and row['ttm_ebit'] > 0 and post_tax is not None and invested_capital not in (None, 0):
@@ -659,8 +663,8 @@ def compute_and_upsert_extended_factors(conn, factor_date, engine, indicators):
             np_margin = safe_div(row['ttm_net_income'], row['ttm_sales'])
 
         yrs_to_cash = None
-        if row['long_term_debt'] is not None and row['short_term_debt'] is not None and row['ttm_cash_flows'] not in (None, 0) and row['ttm_capex'] not in (None, 0 ): 
-            yrs_to_cash = safe_div(row['long_term_debt'] + row['short_term_debt'] , (row['ttm_cash_flows']-row['ttm_capex']))
+        if row['long_term_debt'] is not None and row['short_term_debt'] is not None and row['ttm_cash_flows'] not in (None, 0) and row['ttm_capex'] not in (None, 0 ) and row['cash_and_equiv'] not in (None, 0): 
+            yrs_to_cash = safe_div(row['long_term_debt'] + row['short_term_debt'] - row['cash_and_equiv'] , (row['ttm_cash_flows']-row['ttm_capex']))
 
         div_cover = None
         div_cover = safe_div(row['ttm_div'], row['ttm_net_income'])
@@ -768,11 +772,14 @@ def count_valid_factors_per_date(conn, factor_date):
         for factor_name, count in rows:
             print(f"  {factor_name}: {count}")
 
+            
 def run_full_rebuild(conn, engine):
     start_date = date(2000,1,1)
     today = datetime.today()
     end_date = (today.replace(day=1) - timedelta(days=1)).date()
     dates = get_monthly_eom_dates(start_date, end_date)
+    print(f"Running full rebuild from {start_date} to {end_date}")
+
     for factor_date in dates:
         print(f"Processing fundamental factors for {factor_date}")
         for indicator in indicators:
@@ -786,6 +793,7 @@ def run_incremental_update(conn, engine, since_date):
     today = datetime.today()
     last_month_end = (today.replace(day=1) - timedelta(days=1)).date()
     dates = get_monthly_eom_dates(since_date, last_month_end)
+    print(f"Running incremental rebuild from {since_date} to {last_month_end}")
     for factor_date in dates:
         print(f"Processing fundamental factors for {factor_date}")
         for indicator in indicators:
@@ -794,6 +802,81 @@ def run_incremental_update(conn, engine, since_date):
         compute_and_upsert_growth_factors(conn, factor_date, engine)
         count_valid_factors_per_date(conn, factor_date)
         conn.commit()
+
+def rebuild_specific_factors(conn, engine, target_factors, start_date=None, end_date=None):
+    """
+    Rebuild full factor history only for specified target factors,
+    preserving the original flow: raw factors → extended factors → growth factors.
+
+    :param conn: psycopg2 connection
+    :param engine: SQLAlchemy engine
+    :param start_date: datetime.date, rebuild start date (default 2000-01-01)
+    :param end_date: datetime.date, rebuild end date (default last month end)
+    """
+
+    start_date = date(2000,1,1)
+    today = datetime.today()
+    end_date = (today.replace(day=1) - timedelta(days=1)).date()
+    dates = get_monthly_eom_dates(start_date, end_date)
+    print(f"Running full rebuild for {target_factors} from {start_date} to {end_date}")
+
+    # Define dependency map of extended/growth factors to underlying raw factor_names
+    dependency_map = {
+        'div_yield': ['ttm_div', 'market_cap'],
+        'div_cover': ['ttm_div', 'ttm_net_income'],
+        'debt_to_equity': ['long_term_debt', 'short_term_debt', 'cash_and_equiv', 'total_equity_last'],
+        'ttm_eps': ['ttm_net_income', 'shares_diluted'],
+        'enterprise_value': ['market_cap', 'long_term_debt', 'short_term_debt', 'cash_and_equiv'],
+        'yrs_to_cash': ['ttm_cash_flows', 'ttm_capex', 'ttm_fcf', 'cash_and_equiv','long_term_debt', 'short_term_debt', 'cash_and_equiv'],
+        'post_tax': ['ttm_tax', 'ttm_pbt'],
+        'working_capital': ['curr_assets', 'curr_liab'],
+        'invested_capital_nf': ['working_capital', 'cash_and_equiv', 'net_fixed_assets'],
+        'invested_capital_f': ['total_equity_last', 'preferred_equity_last'],
+        'invested_capital': ['invested_capital_nf', 'invested_capital_f'],
+        'roic': ['ttm_ebit', 'post_tax', 'invested_capital'],
+        'np_margin': ['ttm_net_income', 'ttm_sales'],
+        'ebit_yield': ['ttm_ebit', 'enterprise_value'],
+        'pe': ['ttm_net_income', 'market_cap']
+
+        # Extend this map with other target factor dependencies if needed
+    }
+
+    # Collect all needed raw factor names based on target factors
+    needed_raw_factors = set()
+    for f in target_factors:
+        needed_raw_factors.update(dependency_map.get(f, []))
+
+    # Filter indicators to those that produce required raw factors
+    indicators_to_build = [ind for ind in indicators if ind['factor_name'] in needed_raw_factors]
+
+    # Extended and growth factor sets for conditional recomputation
+    extended_factors = {
+        'working_capital', 'ttm_eps', 'post_tax', 'ttm_fcf', 'invested_capital',
+        'enterprise_value', 'ebit_yield', 'pe', 'pb', 'roe', 'roa', 'div_yield',
+        'div_cover', 'debt_to_equity', 'roic', 'fcf_yield', 'gp_margin',
+        'np_margin', 'yrs_to_cash'
+    }
+    growth_factors = ['ttm_sales', 'ttm_fcf', 'ttm_net_income', 'ttm_eps', 'ttm_div', 'shares_diluted']
+
+    for factor_date in dates:
+        print(f"Rebuilding specified factors for {factor_date}...")
+
+        # Step 1: Rebuild relevant raw factors via build_factor_generic
+        for indicator in indicators_to_build:
+            build_factor_generic(conn, factor_date, indicator)
+
+        # Step 2: Conditionally compute extended factors if any target matches
+        if any(f in extended_factors for f in target_factors):
+            # Pass the filtered indicators subset so extended factor computation matches rebuilt raw factors
+            compute_and_upsert_extended_factors(conn, factor_date, engine, indicators_to_build)
+
+        # Step 3: Conditionally compute growth factors if target matches growth_factors
+        if any(f in growth_factors for f in target_factors):
+            compute_and_upsert_growth_factors(conn, factor_date, engine)
+
+        count_valid_factors_per_date(conn, factor_date)
+        conn.commit()
+
 
 if __name__ == "__main__":
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -807,15 +890,23 @@ if __name__ == "__main__":
     conn.set_client_encoding('UTF8')
 
     try:
-        mode = decide_mode()
-        # mode = 'full'
-        if mode == 'full':
-            run_full_rebuild(conn, engine)
-        elif mode == 'incremental':
-            since_date = datetime.today().date() - timedelta(days=180)
-            run_incremental_update(conn, engine, since_date)
-        else:
-            print("Not scheduled to run today")
+        # target_factors = ['enterprise_value','post_tax', 'working_capital', 'invested_capital_nf', 'invested_capital_f']
+        # , 'invested_capital','roic', 'np_margin','ebit_yield','pe','div_yield', 'div_cover', 'yrs_to_cash','ttm_eps','pe']
+        # 'debt_to_equity'
+        target_factors =[]
+        if target_factors: 
+            print(f"Rebuilding specific factors:  {target_factors}")
+            rebuild_specific_factors(conn, engine, target_factors)
+        else: 
+            mode = decide_mode()
+            # mode = 'full'
+            if mode == 'full':
+                run_full_rebuild(conn, engine)
+            elif mode == 'incremental':
+                since_date = datetime.today().date() - timedelta(days=180)
+                run_incremental_update(conn, engine, since_date)
+            else:
+                print("Not scheduled to run today")
     finally:
         conn.close()
         print("DB connection closed.")
