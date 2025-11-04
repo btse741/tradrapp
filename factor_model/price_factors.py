@@ -6,6 +6,7 @@ import pandas as pd
 import numpy as np
 import io
 import gc
+import argparse
 from tqdm import tqdm
 from sqlalchemy import create_engine
 from datetime import datetime, date, timedelta
@@ -17,13 +18,16 @@ def decide_mode(today=None):
         today = date.today()
     yesterday = today - timedelta(days=1)
     month_changed = yesterday.month != today.month
+    
     if today.weekday() == 1:  # Tuesday
         saturday = today - timedelta(days=3)
         sunday = today - timedelta(days=2)
         monday = today - timedelta(days=1)
         month_changed = any(d.month != today.month for d in [saturday, sunday, monday])
+    
     if not month_changed:
         return None
+    
     if today.weekday() == 1:
         for day in [monday, sunday, saturday]:
             if day.month != today.month:
@@ -31,29 +35,34 @@ def decide_mode(today=None):
                 break
     else:
         month_change_day = yesterday
-    if (month_change_day.month == 1 or month_change_day.month == 7) and month_change_day.weekday() == 4 and 1 <= month_change_day.day <= 7:
+
+    if (month_change_day.month == 1 or month_change_day.month == 7) and \
+       month_change_day.weekday() == 4 and 1 <= month_change_day.day <= 7:
         return 'full'
     return 'incremental'
 
 
+def clear_staging_table(conn, staging_table):
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"TRUNCATE {staging_table};")
+        conn.commit()
+        print(f"Staging table {staging_table} cleared.")
+    except Exception as e:
+        conn.rollback()
+        print(f"Error clearing staging table {staging_table}: {e}")
+        raise
+
+
 def bulk_copy_from_df(conn, df, table_name):
     print(f"Starting bulk copy to {table_name} with {len(df)} rows...")
-
-    # Sanitize string columns
     for col in df.select_dtypes(include=['object']):
         df[col] = df[col].astype(str).str.replace('\n', ' ', regex=False).str.replace('\t', ' ', regex=False)
-
-    # Replace infinite values
     df.replace([float('inf'), float('-inf')], pd.NA, inplace=True)
-
-    # Ensure date columns are string formatted as YYYY-MM-DD
     if 'factor_date' in df.columns:
         df['factor_date'] = pd.to_datetime(df['factor_date']).dt.strftime('%Y-%m-%d')
-
-    # Preview sample data in DataFrame form
     print("Sample data:\n", df.head(3))
 
-    # Use BytesIO and encode CSV as utf-8 bytes
     f = io.BytesIO()
     csv_bytes = df.to_csv(sep='\t', header=False, index=False, na_rep='\\N').encode('utf-8')
     f.write(csv_bytes)
@@ -70,7 +79,6 @@ def bulk_copy_from_df(conn, df, table_name):
         raise
 
 
-
 def upsert_from_staging(conn, staging_table, target_table, conflict_cols, update_cols):
     updates = ', '.join([f"{col} = EXCLUDED.{col}" for col in update_cols])
     conflict_keys = ', '.join(conflict_cols)
@@ -85,22 +93,10 @@ def upsert_from_staging(conn, staging_table, target_table, conflict_cols, update
             cur.execute(sql)
         conn.commit()
         print(f"Upsert from {staging_table} to {target_table} successful.")
-    except psycopg2.Error as e:
+    except Exception as e:
         conn.rollback()
-        print(f"Error during upsert from {staging_table}: {e.pgcode} - {e.pgerror}")
-        raise e
-
-
-def clear_staging_table(conn, staging_table):
-    try:
-        with conn.cursor() as cur:
-            cur.execute(f"TRUNCATE {staging_table};")
-        conn.commit()
-        print(f"Staging table {staging_table} cleared.")
-    except psycopg2.Error as e:
-        conn.rollback()
-        print(f"Error clearing staging table {staging_table}: {e.pgcode} - {e.pgerror}")
-        raise e
+        print(f"Error during upsert from {staging_table}: {e}")
+        raise
 
 
 def load_daily_prices(engine, start_date, end_date):
@@ -120,25 +116,24 @@ def calculate_kama(prices, n=10, fast=2, slow=30):
     change = prices.diff(n).abs()
     volatility = prices.diff().abs().rolling(window=n).sum()
     er = change / volatility
-    er = er.replace([np.inf, -np.inf], np.nan)  # catch infinite values
+    er = er.replace([np.inf, -np.inf], np.nan)
 
     sc_fast = 2 / (fast + 1)
     sc_slow = 2 / (slow + 1)
     sc = (er * (sc_fast - sc_slow) + sc_slow) ** 2
-    sc = sc.replace([np.inf, -np.inf], np.nan)  # also catch here
+    sc = sc.replace([np.inf, -np.inf], np.nan)
 
     kama = pd.Series(index=prices.index, dtype=float)
     kama.iloc[:n] = prices.iloc[:n].mean()
     for i in range(n, len(prices)):
-        if pd.isna(sc.iloc[i]) or pd.isna(prices.iloc[i]) or pd.isna(kama.iloc[i-1]):
-            kama.iloc[i] = np.nan  # prevent infinite propagation
+        if pd.isna(sc.iloc[i]) or pd.isna(prices.iloc[i]) or pd.isna(kama.iloc[i - 1]):
+            kama.iloc[i] = np.nan
         else:
             kama.iloc[i] = kama.iloc[i - 1] + sc.iloc[i] * (prices.iloc[i] - kama.iloc[i - 1])
     return kama
 
 
 def safe_momentum_calc(series, lag1, lag2):
-    
     prev1 = series.shift(lag1)
     prev2 = series.shift(lag2)
     valid = (prev2 != 0) & prev2.notna() & prev1.notna()
@@ -146,11 +141,10 @@ def safe_momentum_calc(series, lag1, lag2):
     valid_idxs = valid[valid].index
     result.loc[valid_idxs] = (prev1.loc[valid_idxs] / prev2.loc[valid_idxs] - 1) * 100
     result = result.replace([np.inf, -np.inf], np.nan)
-    return result 
+    return result
 
 
 def safe_pct_change(s, lag):
-    
     prev = s.shift(lag)
     valid = (prev != 0) & prev.notna()
     result = pd.Series(np.nan, index=s.index)
@@ -158,6 +152,7 @@ def safe_pct_change(s, lag):
     result.loc[valid_idxs] = ((s.loc[valid_idxs] - prev.loc[valid_idxs]) / prev.loc[valid_idxs]) * 100
     result = result.replace([np.inf, -np.inf], np.nan)
     return result
+
 
 def compute_indicators(df):
     print("Computing technical indicators...")
@@ -238,6 +233,7 @@ def compute_indicators(df):
 
     return df
 
+
 def compute_monthly_factors(df_daily):
     print("Computing monthly factors...")
     df_daily['month_end'] = df_daily['date'].dt.to_period('M').apply(lambda r: r.end_time.date())
@@ -277,198 +273,244 @@ def prepare_factor_df(df, factor_names, date_col='date'):
     print("Preparing factor DataFrame for upsert...")
     cols = ['ticker', date_col] + factor_names
     df_factor = df[cols].copy()
-    df_melted = df_factor.melt(id_vars=['ticker', date_col],
-                               var_name='factor_name', value_name='factor_value')
+
+    df_melted = df_factor.melt(
+        id_vars=['ticker', date_col],
+        var_name='factor_name',
+        value_name='factor_value'
+    )
+
     if date_col != 'factor_date':
-        df_melted = df_melted.rename(columns={date_col:'factor_date'})
+        df_melted = df_melted.rename(columns={date_col: 'factor_date'})
     return df_melted
 
+
 def optimize_df_memory(df):
-    # Downcast numeric columns to reduce memory usage
+    # Downcast numeric columns
     for col in df.select_dtypes(include=['float64']).columns:
         df[col] = pd.to_numeric(df[col], downcast='float')
     for col in df.select_dtypes(include=['int64']).columns:
         df[col] = pd.to_numeric(df[col], downcast='integer')
     # Convert object columns with few unique values to categorical
     for col in df.select_dtypes(include=['object']).columns:
-        num_unique_values = df[col].nunique()
-        num_total_values = len(df[col])
-        if num_unique_values / num_total_values < 0.5:
+        num_unique = df[col].nunique()
+        total = len(df[col])
+        if num_unique / total < 0.5:
             df[col] = df[col].astype('category')
 
+
 def process_factor_df_in_chunks(conn, df, factor_names, date_col='date',
-                               chunk_size=1000, staging_table='staging_daily_factors',
+                               staging_table='staging_daily_factors',
                                target_table='daily_factors',
                                conflict_cols=['ticker', 'factor_date', 'factor_name'],
-                               update_cols=['factor_value']):
+                               update_cols=['factor_value'],
+                               use_staging=True):
+    """
+    Process the dataframe month-by-month with progress bar,
+    clearing staging table before each load and dropping duplicate keys.
+    """
+    df[date_col] = pd.to_datetime(df[date_col])
+    months = df[date_col].dt.to_period('M').sort_values().unique()
 
-    tickers = df['ticker'].unique()
-    for i in range(0, len(tickers), chunk_size):
-        chunk_tickers = tickers[i:i + chunk_size]
-        df_chunk = df[df['ticker'].isin(chunk_tickers)].copy()
+    for month_period in tqdm(months, desc='Processing months'):
+        df_month = df[df[date_col].dt.to_period('M') == month_period]
+        if df_month.empty:
+            continue
+
         cols = ['ticker', date_col] + factor_names
-        df_factor = df_chunk[cols].copy()
-
-        # Your existing memory and dtype optimizations here
-        # ...
+        df_factor = df_month[cols].copy()
 
         df_melted = df_factor.melt(id_vars=['ticker', date_col],
-                                   var_name='factor_name', value_name='factor_value',
+                                   var_name='factor_name',
+                                   value_name='factor_value',
                                    ignore_index=True)
 
         if date_col != 'factor_date':
-            df_melted = df_melted.rename(columns={date_col: 'factor_date'})
+            df_melted.rename(columns={date_col: 'factor_date'}, inplace=True)
 
-        # Add null ticker check and drop before bulk copy
+        # Drop duplicates to avoid unique constraint violation on bulk insert
+        df_melted.drop_duplicates(subset=['ticker', 'factor_date', 'factor_name'], inplace=True)
+
         null_tickers = df_melted['ticker'].isnull().sum()
         if null_tickers > 0:
             print(f"Warning: Dropping {null_tickers} rows with NULL tickers before bulk copy.")
-            df_melted = df_melted.dropna(subset=['ticker'])
+            df_melted.dropna(subset=['ticker'], inplace=True)
 
-        # Proceed with bulk copy and upsert
-        bulk_copy_from_df(conn, df_melted, staging_table)
-        upsert_from_staging(conn, staging_table, target_table, conflict_cols, update_cols)
-        clear_staging_table(conn, staging_table)
-        print(f"Processed chunk {i // chunk_size + 1} with {len(chunk_tickers)} tickers.")
+        if use_staging:
+            # Clear staging table before bulk copy to prevent duplicates
+            clear_staging_table(conn, staging_table)
 
-        # Explicitly delete large DataFrames and collect garbage
-        del df_chunk, df_factor, df_melted
+            # Bulk copy data into staging
+            bulk_copy_from_df(conn, df_melted, staging_table)
+
+            # Upsert into target table from staging
+            upsert_from_staging(conn, staging_table, target_table, conflict_cols, update_cols)
+
+            # Clear staging table after successful upsert
+            clear_staging_table(conn, staging_table)
+        else:
+            print(f"Staging disabled for month {month_period}, skipping DB operations.")
+
+        del df_month, df_factor, df_melted
         gc.collect()
 
 
-def run_full_update(conn, engine, start_date, end_date):
-    print("Starting full update...")
+def run_full_update(conn, engine, start_date, end_date, use_staging=True):
+    print(f"Starting full update from {start_date} to {end_date}...")
+
     df_daily = load_daily_prices(engine, start_date, end_date)
     df_indicators = compute_indicators(df_daily)
 
     factors_daily = [
-        'adj_close','market_cap','dist52hi','dist52lo','vwap_10d','vwap_mtd',
-        'sma_50d','sma_200d','ema_20d','ema_50d','ema_100d','ema_200d',
-        'kama_10','kama_50','daily_turnover','atr_14d','illiquidity',
-        'range_volatility','std_30d','std_3m','std_6m','std_12m'
+        'adj_close', 'market_cap', 'dist52hi', 'dist52lo', 'vwap_10d', 'vwap_mtd',
+        'sma_50d', 'sma_200d', 'ema_20d', 'ema_50d', 'ema_100d', 'ema_200d',
+        'kama_10', 'kama_50', 'daily_turnover', 'atr_14d', 'illiquidity',
+        'range_volatility', 'std_30d', 'std_3m', 'std_6m', 'std_12m'
     ]
 
-    process_factor_df_in_chunks(
-        conn,
-        df_indicators,
-        factors_daily,
-        date_col='date',
-        chunk_size=1000,
-        staging_table='staging_daily_factors',
-        target_table='daily_factors',
-        conflict_cols=['ticker','factor_date','factor_name'],
-        update_cols=['factor_value']
-    )
+    # Upload daily factors
+    process_factor_df_in_chunks(conn, df_indicators, factors_daily, date_col='date', use_staging=use_staging)
     print("Daily factors upsert complete.")
 
-    df_monthly = compute_monthly_factors(df_indicators)
-
+    # Compute monthly factors
+    df_monthly = compute_monthly_factors(df_daily)
     factors_monthly = [
-        'avg_daily_turnover','avg_illiquidity','mom_12m','mom_6m','mom_3m',
-        'pct_change_1m','pct_change_3m','pct_change_6m','pct_change_12m',
-        'pct_change_24m','pct_change_60m'
+        'avg_daily_turnover', 'avg_illiquidity', 'adj_close', 'mom_12m', 'mom_6m', 'mom_3m',
+        'pct_change_1m', 'pct_change_3m', 'pct_change_6m', 'pct_change_12m', 'pct_change_24m', 'pct_change_60m'
     ]
 
-    df_factors_monthly = prepare_factor_df(df_monthly, factors_monthly, date_col='factor_date')
-    bulk_copy_from_df(conn, df_factors_monthly, 'staging_monthly_factors')
-    upsert_from_staging(conn, 'staging_monthly_factors', 'monthly_factors',
-                        conflict_cols=['ticker','factor_date','factor_name'],
-                        update_cols=['factor_value'])
-    clear_staging_table(conn, 'staging_monthly_factors')
+    # Upload monthly factors with progress and staging
+    process_factor_df_in_chunks(conn, df_monthly, factors_monthly, date_col='factor_date',
+                               staging_table='staging_monthly_factors',
+                               target_table='monthly_factors',
+                               conflict_cols=['ticker', 'factor_date', 'factor_name'],
+                               update_cols=['factor_value'],
+                               use_staging=use_staging)
     print("Monthly factors upsert complete.")
     print("Full update complete.")
 
 
-def run_incremental_update(conn, engine, since_date):
+def run_incremental_update(conn, engine, since_date, use_staging=True):
     print("Starting incremental update...")
+
     df_daily = load_daily_prices(engine, since_date, date.today())
     df_indicators = compute_indicators(df_daily)
 
     factors_daily = [
-        'adj_close','market_cap','dist52hi','dist52lo','vwap_10d','vwap_mtd',
-        'sma_50d','sma_200d','ema_20d','ema_50d','ema_100d','ema_200d',
-        'kama_10','kama_50','daily_turnover','atr_14d','illiquidity',
-        'range_volatility','std_30d','std_3m','std_6m','std_12m'
+        'adj_close', 'market_cap', 'dist52hi', 'dist52lo', 'vwap_10d', 'vwap_mtd',
+        'sma_50d', 'sma_200d', 'ema_20d', 'ema_50d', 'ema_100d', 'ema_200d',
+        'kama_10', 'kama_50', 'daily_turnover', 'atr_14d', 'illiquidity',
+        'range_volatility', 'std_30d', 'std_3m', 'std_6m', 'std_12m'
     ]
 
-    df_factors_daily = prepare_factor_df(df_indicators, factors_daily, date_col='date')
+    # Upload daily factors incrementally
+    process_factor_df_in_chunks(conn, df_indicators, factors_daily, date_col='date', use_staging=use_staging)
 
-    bulk_copy_from_df(conn, df_factors_daily, 'staging_daily_factors')
-    upsert_from_staging(conn, 'staging_daily_factors', 'daily_factors',
-                        conflict_cols=['ticker','factor_date','factor_name'],
-                        update_cols=['factor_value'])
-    clear_staging_table(conn, 'staging_daily_factors')
-    print("Daily factors incremental upsert complete.")
-
-    df_monthly = compute_monthly_factors(df_indicators)
-
+    # Compute monthly factors
+    df_monthly = compute_monthly_factors(df_daily)
     factors_monthly = [
-        'avg_daily_turnover','avg_illiquidity','mom_12m','mom_6m','mom_3m',
-        'pct_change_1m','pct_change_3m','pct_change_6m','pct_change_12m',
-        'pct_change_24m','pct_change_60m'
+        'avg_daily_turnover', 'avg_illiquidity', 'adj_close', 'mom_12m', 'mom_6m', 'mom_3m',
+        'pct_change_1m', 'pct_change_3m', 'pct_change_6m', 'pct_change_12m', 'pct_change_24m', 'pct_change_60m'
     ]
 
-    df_factors_monthly = prepare_factor_df(df_monthly, factors_monthly, date_col='factor_date')
+    # Upload monthly factors incrementally
+    process_factor_df_in_chunks(conn, df_monthly, factors_monthly, date_col='factor_date',
+                               staging_table='staging_monthly_factors',
+                               target_table='monthly_factors',
+                               conflict_cols=['ticker', 'factor_date', 'factor_name'],
+                               update_cols=['factor_value'],
+                               use_staging=use_staging)
 
-    bulk_copy_from_df(conn, df_factors_monthly, 'staging_monthly_factors')
-    upsert_from_staging(conn, 'staging_monthly_factors', 'monthly_factors',
-                        conflict_cols=['ticker','factor_date','factor_name'],
-                        update_cols=['factor_value'])
-    clear_staging_table(conn, 'staging_monthly_factors')
-    print("Monthly factors incremental upsert complete.")
     print("Incremental update complete.")
 
 
-def run_daily_incremental_update(conn, engine):
-    update_day = datetime.today().date() - timedelta(days=30)
-    lookback_days = 252  # longest rolling window or factors
+def run_daily_incremental_update(conn, engine, use_staging=True):
+    update_day = datetime.today().date() - timedelta(days=1)
+    lookback_days = 252
     extended_start = update_day - timedelta(days=lookback_days)
     print(f"Running daily factors update for {update_day} with lookback from {extended_start}...")
+
     df_daily = load_daily_prices(engine, extended_start, update_day)
     df_indicators = compute_indicators(df_daily)
 
     factors_daily = [
-        'adj_close','market_cap','dist52hi','dist52lo','vwap_10d','vwap_mtd',
-        'sma_50d','sma_200d','ema_20d','ema_50d','ema_100d','ema_200d',
-        'kama_10','kama_50','daily_turnover','atr_14d','illiquidity',
-        'range_volatility','std_30d','std_3m','std_6m','std_12m'
+        'adj_close', 'market_cap', 'dist52hi', 'dist52lo', 'vwap_10d', 'vwap_mtd',
+        'sma_50d', 'sma_200d', 'ema_20d', 'ema_50d', 'ema_100d', 'ema_200d',
+        'kama_10', 'kama_50', 'daily_turnover', 'atr_14d', 'illiquidity',
+        'range_volatility', 'std_30d', 'std_3m', 'std_6m', 'std_12m'
     ]
 
-    df_factors_daily = prepare_factor_df(df_indicators, factors_daily, date_col='date')
+    # Upload daily factors incrementally
+    process_factor_df_in_chunks(conn, df_indicators, factors_daily, date_col='date', use_staging=use_staging)
 
-    bulk_copy_from_df(conn, df_factors_daily, 'staging_daily_factors')
-    upsert_from_staging(conn, 'staging_daily_factors', 'daily_factors',
-                        conflict_cols=['ticker','factor_date','factor_name'],
-                        update_cols=['factor_value'])
-    clear_staging_table(conn, 'staging_daily_factors')
+    # Compute monthly factors
+    df_monthly = compute_monthly_factors(df_daily)
+    factors_monthly = [
+        'avg_daily_turnover', 'avg_illiquidity', 'adj_close', 'mom_12m', 'mom_6m', 'mom_3m',
+        'pct_change_1m', 'pct_change_3m', 'pct_change_6m', 'pct_change_12m', 'pct_change_24m', 'pct_change_60m'
+    ]
+
+    # Upload monthly factors incrementally
+    process_factor_df_in_chunks(conn, df_monthly, factors_monthly, date_col='factor_date',
+                               staging_table='staging_monthly_factors',
+                               target_table='monthly_factors',
+                               conflict_cols=['ticker', 'factor_date', 'factor_name'],
+                               update_cols=['factor_value'],
+                               use_staging=use_staging)
+
     print("Daily factors incremental upsert complete.")
 
 
+
+
 if __name__ == "__main__":
+    # parser = argparse.ArgumentParser(description='Run factor model updates with optional staging and date control.')
+    # parser.add_argument('--start_date', type=lambda s: datetime.strptime(s, '%Y-%m-%d').date(),
+    #                     default=date(2000, 1, 1), help='Start date YYYY-MM-DD (default: 2000-01-01)')
+    # parser.add_argument('--end_date', type=lambda s: datetime.strptime(s, '%Y-%m-%d').date(),
+    #                     default=datetime.today().date(), help='End date YYYY-MM-DD (default: today)')
+    # parser.add_argument('--use_staging', action='store_true', help='Enable staging steps during processing')
+    # parser.add_argument('--mode', type=str, choices=['full', 'incremental'], default='full',
+    #                     help='Update mode: full or incremental (default: full)')
+
+    # args = parser.parse_args()
+    # start = args.start_date
+    # end = args.end_date
+    # use_staging = args.use_staging
+    # mode = args.mode
+    use_staging = False
+    today = datetime.today().date()
+    start = date(2000, 1, 1)   # set your desired start date here
+    end = (today.replace(day=1) - timedelta(days=1))   # set your desired end date here
+    mode = decide_mode()              # set mode to 'full' or 'incremental' here
+
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
     config_path = os.path.join(project_root, 'config.yml')
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
+
     params = config['database']
     conn_str = f"postgresql+psycopg2://{params['user']}:{params['password']}@{params['host']}:{params['port']}/{params['dbname']}"
     engine = create_engine(conn_str)
-    conn = psycopg2.connect(dbname=params['dbname'], user=params['user'], password=params['password'],
-                            host=params['host'], port=params['port'])
+    conn = psycopg2.connect(
+        dbname=params['dbname'],
+        user=params['user'],
+        password=params['password'],
+        host=params['host'],
+        port=params['port']
+    )
     conn.set_client_encoding('UTF8')
 
     try:
-        # mode = decide_mode()
-        mode = 'full'
         if mode == 'full':
-            start = date(2000, 1, 1)
-            today = datetime.today().date()
-            end = (today.replace(day=1) - timedelta(days=1))
-            run_full_update(conn, engine, start, end)
+            # Adjust end date to last day of previous month if needed
+            end_adj = end.replace(day=1) - timedelta(days=1)
+            run_full_update(conn, engine, start, end_adj, use_staging=use_staging)
         elif mode == 'incremental':
-            since = datetime.today().date() - timedelta(days=180)
-            run_incremental_update(conn, engine, since)
+            since = start  # or computed from args or use start arg directly
+            run_incremental_update(conn, engine, since, use_staging=use_staging)
 
-        run_daily_incremental_update(conn, engine)
+        run_daily_incremental_update(conn, engine, use_staging=use_staging)
 
     finally:
         conn.close()
