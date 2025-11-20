@@ -28,3 +28,6 @@ logs/
 
 # Sensitive or large data (not to include in image build)
 stockdata/
+
+app_pages/
+

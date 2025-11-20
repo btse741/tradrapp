@@ -1,67 +1,71 @@
-# Stage 1: Builder stage - build and compile dependencies
-FROM python:3.11-slim AS builder
+# Stage 1: Builder - build dependencies and wheels
+FROM nvidia/cuda:11.8.0-devel-ubuntu20.04 AS builder
 
-# Set working directory inside container
 WORKDIR /app
 
-# Environment variables for cleaner Python behavior inside containers
+# Prevent interactive prompts during package installs
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Etc/UTC
+
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
+# Environment variables for cleaner Python behavior
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# Install system dependencies needed to build some Python packages and R with dev tools
+# Install system dependencies, build tools, python, R, and libraries
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc build-essential libpq-dev \
+    gcc build-essential libpq-dev python3 python3-pip python3-dev \
     r-base r-base-dev libcurl4-openssl-dev libssl-dev libxml2-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install required R packages at build time
-RUN R -e "install.packages(c('DBI', 'RPostgres', 'dplyr', 'simfinapi', 'yaml', 'lubridate', 'glue', 'data.table', 'magrittr', 'telegram.bot'), repos='https://cloud.r-project.org/')"
-
-# Copy only requirements first to leverage Docker cache when code changes
+# Copy requirements and build wheels (with pip cache for speed)
 COPY requirements.txt .
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip3 wheel --no-cache-dir --no-deps --wheel-dir /wheels -r requirements.txt
 
-# Build wheels for all dependencies, speeding up final image installs
-RUN pip wheel --no-cache-dir --no-deps --wheel-dir /wheels -r requirements.txt
+# Optional: build wheels for specific heavy packages like numba and llvmlite
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip3 wheel --no-cache-dir --no-deps --wheel-dir /wheels numba llvmlite
 
-
-# Stage 2: Final runtime stage - slim image only, no build dependencies
-FROM python:3.11-slim
+# Stage 2: Runtime - slim image
+FROM nvidia/cuda:11.8.0-runtime-ubuntu20.04
 
 WORKDIR /app
 
-# Environment variables for runtime
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
+# Prevent interactive prompts during package installs
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Etc/UTC
 
-# Install OS dependencies needed for Playwright Chromium browser and R runtime and dev libraries
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
+# Install Python3, pip3, runtime dependencies, and R packages
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    wget libnss3 libatk-bridge2.0-0 libcups2 libx11-xcb1 libxcomposite1 libxdamage1 \
-    libxrandr2 libgbm1 libasound2 libpangocairo-1.0-0 libgtk-3-0 libxshmfence1 libxss1 \
-    r-base r-base-dev libcurl4-openssl-dev libssl-dev libxml2-dev libpq-dev \
+    python3 python3-pip r-base r-base-dev libcurl4-openssl-dev libssl-dev libxml2-dev libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install required R packages at runtime in final image
-RUN R -e "install.packages(c('DBI', 'RPostgres', 'dplyr', 'digest', 'simfinapi', 'yaml', 'lubridate', 'glue', 'data.table', 'magrittr', 'telegram.bot'), repos='https://cloud.r-project.org/')"
-
-# Copy built wheels from builder stage
+# Copy wheels and requirements
 COPY --from=builder /wheels /wheels
-COPY --from=builder /app/requirements.txt .
+COPY requirements.txt .
 
-# Install all dependencies from wheels for fast, repeatable install
-RUN pip install --no-cache-dir /wheels/*
+# Install all dependencies from pre-built wheels (with pip cache)
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip3 install --no-cache-dir /wheels/*
 
-# Install Playwright and Chromium browser
-RUN pip install playwright \
-    && python -m playwright install chromium
+# Install Playwright and its dependencies
+RUN pip3 install playwright && python3 -m playwright install chromium
 
-# Copy the application source code to the container
+# Copy your app code
 COPY . /app
 
-# Create data and output directories expected by your scripts
+# Create necessary directories
 RUN mkdir -p /app/data /app/output
 
-# Ensure run_all.sh is executable
+# Make your script executable
 RUN chmod +x /app/run_all.sh
 
-# Default command to execute your shell script that runs update scripts
+# Set CUDA library path environment variable
+ENV LD_LIBRARY_PATH=/usr/local/cuda-11.8/lib64:${LD_LIBRARY_PATH}
+
+# Default command to run your script
 CMD ["/app/run_all.sh"]

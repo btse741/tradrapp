@@ -286,8 +286,8 @@ if __name__ == "__main__":
         'host': params['host'],
         'port': params['port']
     }
-    # mode = decide_mode()
-    mode = 'full'
+    mode = decide_mode()
+    # mode = 'full'
     if mode == 'full':
         start_date = date(2005, 1, 1)
         today = datetime.today()

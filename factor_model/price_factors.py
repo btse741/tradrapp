@@ -1,17 +1,16 @@
 import os
 import yaml
 import psycopg2
-import psycopg2.extras
 import pandas as pd
 import numpy as np
 import io
 import gc
-import argparse
+import multiprocessing as mp
 from tqdm import tqdm
 from sqlalchemy import create_engine
 from datetime import datetime, date, timedelta
 from dateutil.relativedelta import relativedelta
-
+from numba import njit
 
 def decide_mode(today=None):
     if today is None:
@@ -36,71 +35,190 @@ def decide_mode(today=None):
     else:
         month_change_day = yesterday
 
+
     if (month_change_day.month == 1 or month_change_day.month == 7) and \
        month_change_day.weekday() == 4 and 1 <= month_change_day.day <= 7:
         return 'full'
     return 'incremental'
 
 
-def clear_staging_table(conn, staging_table):
-    try:
-        with conn.cursor() as cur:
-            cur.execute(f"TRUNCATE {staging_table};")
-        conn.commit()
-        print(f"Staging table {staging_table} cleared.")
-    except Exception as e:
-        conn.rollback()
-        print(f"Error clearing staging table {staging_table}: {e}")
-        raise
+# Optimized KAMA calculation with caching and fastmath enabled.
+@njit(cache=True, fastmath=True)
+def calculate_kama_numba(prices, n=10, fast=2, slow=30):
+    length = len(prices)
+    kama = np.empty(length, dtype=np.float64)
+    kama[:] = np.nan
+
+    if length < n:
+        return kama
+
+    sc_fast = 2 / (fast + 1)
+    sc_slow = 2 / (slow + 1)
+
+    count = 0
+    total = 0.0
+    for i in range(n):
+        if not np.isnan(prices[i]):
+            total += prices[i]
+            count += 1
+    if count > 0:
+        kama[n-1] = total / count
+    else:
+        kama[n-1] = np.nan
+
+    for i in range(n, length):
+        if np.isnan(prices[i]) or np.isnan(kama[i-1]):
+            kama[i] = np.nan
+            continue
+        change = abs(prices[i] - prices[i - n])
+
+        volatility = 0.0
+        for j in range(i-n+1, i+1):
+            if not np.isnan(prices[j]) and not np.isnan(prices[j-1]):
+                volatility += abs(prices[j] - prices[j-1])
+        er = change / volatility if volatility != 0 else 0
+        sc = (er * (sc_fast - sc_slow) + sc_slow) ** 2
+        kama[i] = kama[i-1] + sc * (prices[i] - kama[i-1])
+    return kama
 
 
-def bulk_copy_from_df(conn, df, table_name):
-    print(f"Starting bulk copy to {table_name} with {len(df)} rows...")
-    for col in df.select_dtypes(include=['object']):
-        df[col] = df[col].astype(str).str.replace('\n', ' ', regex=False).str.replace('\t', ' ', regex=False)
-    df.replace([float('inf'), float('-inf')], pd.NA, inplace=True)
-    if 'factor_date' in df.columns:
-        df['factor_date'] = pd.to_datetime(df['factor_date']).dt.strftime('%Y-%m-%d')
-    print("Sample data:\n", df.head(3))
-
-    f = io.BytesIO()
-    csv_bytes = df.to_csv(sep='\t', header=False, index=False, na_rep='\\N').encode('utf-8')
-    f.write(csv_bytes)
-    f.seek(0)
-
-    try:
-        with conn.cursor() as cur:
-            cur.copy_from(f, table_name, null='\\N', sep='\t')
-        conn.commit()
-        print(f"Bulk copy to {table_name} successful.")
-    except Exception as e:
-        conn.rollback()
-        print(f"Error during bulk copy to {table_name}: {e}")
-        raise
+def optimize_df_memory(df):
+    for col in df.select_dtypes(include=['float64']).columns:
+        df.loc[:, col] = pd.to_numeric(df[col], downcast='float')
+    for col in df.select_dtypes(include=['int64']).columns:
+        df.loc[:, col] = pd.to_numeric(df[col], downcast='integer')
+    for col in df.select_dtypes(include=['object']).columns:
+        if df[col].nunique() / len(df[col]) < 0.5:
+            df.loc[:, col] = df[col].astype('category')
 
 
-def upsert_from_staging(conn, staging_table, target_table, conflict_cols, update_cols):
-    updates = ', '.join([f"{col} = EXCLUDED.{col}" for col in update_cols])
-    conflict_keys = ', '.join(conflict_cols)
-    sql = f"""
-    INSERT INTO {target_table} (ticker, factor_date, factor_name, factor_value)
-    SELECT ticker, factor_date, factor_name, factor_value FROM {staging_table}
-    ON CONFLICT ({conflict_keys})
-    DO UPDATE SET {updates};
-    """
-    try:
-        with conn.cursor() as cur:
-            cur.execute(sql)
-        conn.commit()
-        print(f"Upsert from {staging_table} to {target_table} successful.")
-    except Exception as e:
-        conn.rollback()
-        print(f"Error during upsert from {staging_table}: {e}")
-        raise
+def batch_rolling_calculations(df):
+    adj_close = df['adj_close']
+    return pd.DataFrame({
+        'sma_50d': adj_close.rolling(50, min_periods=1).mean(),
+        'sma_200d': adj_close.rolling(200, min_periods=1).mean(),
+        'ema_20d': adj_close.ewm(span=20, adjust=False).mean(),
+        'ema_50d': adj_close.ewm(span=50, adjust=False).mean(),
+        'ema_100d': adj_close.ewm(span=100, adjust=False).mean(),
+        'ema_200d': adj_close.ewm(span=200, adjust=False).mean(),
+    })
+
+
+def compute_indicators(df):
+    df = df.copy()
+
+    df.loc[:, 'adjustment_ratio'] = df['adj_close'] / df['close']
+    df.loc[:, 'adjustment_ratio'] = df['adjustment_ratio'].replace([np.inf, -np.inf], np.nan)
+    df.loc[:, 'adj_high'] = df['high'] * df['adjustment_ratio']
+    df.loc[:, 'adj_low'] = df['low'] * df['adjustment_ratio']
+
+    df.loc[:, 'high_52w'] = df.groupby('ticker')['adj_high'].transform(lambda x: x.rolling(252, min_periods=1).max())
+    df.loc[:, 'low_52w'] = df.groupby('ticker')['adj_low'].transform(lambda x: x.rolling(252, min_periods=1).min())
+
+    df.loc[:, 'dist52hi'] = np.where(df['adj_close'] != 0, df['high_52w'] / df['adj_close'] - 1, np.nan)
+    df.loc[:, 'dist52lo'] = np.where(df['low_52w'] != 0, df['adj_close'] / df['low_52w'] - 1, np.nan)
+
+    df.loc[:, 'market_cap'] = df['adj_close'] * df['shares_outstanding']
+    df.loc[:, 'typical_price'] = (df['adj_high'] + df['adj_low'] + df['adj_close']) / 3
+
+    def rolling_vwap(x):
+        pv = x['typical_price'] * x['volume']
+        vol_sum = x['volume'].rolling(10, min_periods=1).sum().replace(0, np.nan)
+        return pv.rolling(10, min_periods=1).sum() / vol_sum
+
+    df.loc[:, 'vwap_10d'] = df.groupby('ticker').apply(rolling_vwap, include_groups=False).reset_index(level=0, drop=True)
+
+    df.loc[:, 'month'] = df['date'].dt.to_period('M')
+
+    def monthly_vwap(sub):
+        cum_vol = sub['volume'].cumsum().replace(0, np.nan)
+        cum_pv = (sub['typical_price'] * sub['volume']).cumsum()
+        return cum_pv / cum_vol
+
+    df.loc[:, 'vwap_mtd'] = df.groupby(['ticker', 'month']).apply(monthly_vwap, include_groups=False).reset_index(level=[0, 1], drop=True)
+
+    rolling_df = df.groupby('ticker').apply(batch_rolling_calculations, include_groups=False).reset_index(level=0, drop=True)
+    df = df.join(rolling_df)
+
+    df.loc[:, 'kama_10'] = df.groupby('ticker')['adj_close'].transform(
+        lambda x: pd.Series(calculate_kama_numba(x.values, n=10, fast=2, slow=20), index=x.index))
+    df.loc[:, 'kama_50'] = df.groupby('ticker')['adj_close'].transform(
+        lambda x: pd.Series(calculate_kama_numba(x.values, n=50, fast=4, slow=50), index=x.index))
+
+    df.loc[:, 'daily_turnover'] = np.where(df['shares_outstanding'] != 0, df['volume'] / df['shares_outstanding'], np.nan)
+    df.loc[:, 'daily_return'] = df.groupby('ticker')['adj_close'].pct_change(fill_method=None)
+
+    mask_invalid = (~np.isfinite(df['daily_return'])) | (df['daily_return'] == 0)
+    df.loc[:, 'illiquidity'] = np.where(mask_invalid, np.nan, 1 / df['daily_return'].abs())
+
+    df.loc[:, 'prev_close'] = df.groupby('ticker')['adj_close'].shift(1)
+    df.loc[:, 'tr1'] = df['adj_high'] - df['adj_low']
+    df.loc[:, 'tr2'] = (df['adj_high'] - df['prev_close']).abs()
+    df.loc[:, 'tr3'] = (df['adj_low'] - df['prev_close']).abs()
+    df.loc[:, 'true_range'] = df[['tr1', 'tr2', 'tr3']].max(axis=1)
+    df.loc[:, 'atr_14d'] = df.groupby('ticker')['true_range'].transform(lambda x: x.rolling(14, min_periods=14).mean())
+
+    df.loc[:, 'range_volatility'] = np.where(df['adj_close'] != 0, (df['adj_high'] - df['adj_low']) / df['adj_close'], np.nan)
+    df.loc[:, 'std_30d'] = df.groupby('ticker')['adj_close'].transform(lambda x: x.rolling(30, min_periods=20).std())
+    df.loc[:, 'std_3m'] = df.groupby('ticker')['adj_close'].transform(lambda x: x.rolling(63, min_periods=45).std())
+    df.loc[:, 'std_6m'] = df.groupby('ticker')['adj_close'].transform(lambda x: x.rolling(126, min_periods=90).std())
+    df.loc[:, 'std_12m'] = df.groupby('ticker')['adj_close'].transform(lambda x: x.rolling(252, min_periods=182).std())
+
+    optimize_df_memory(df)
+
+    return df
+
+
+def safe_momentum_calc(series, lag1, lag2):
+    prev1 = series.shift(lag1)
+    prev2 = series.shift(lag2)
+    valid = (prev2 != 0) & prev2.notna() & prev1.notna()
+    result = pd.Series(np.nan, index=series.index)
+    result.loc[valid] = (prev1.loc[valid] / prev2.loc[valid] - 1) * 100
+    result = result.replace([np.inf, -np.inf], np.nan)
+    return result
+
+
+def safe_pct_change(s, lag):
+    prev = s.shift(lag)
+    valid = (prev != 0) & prev.notna()
+    result = pd.Series(np.nan, index=s.index)
+    result.loc[valid] = ((s.loc[valid] - prev.loc[valid]) / prev.loc[valid]) * 100
+    result = result.replace([np.inf, -np.inf], np.nan)
+    return result
+
+
+def compute_monthly_factors(df_daily):
+    
+    df_daily = df_daily.copy()
+    df_daily['month_end'] = df_daily['date'].dt.to_period('M').apply(lambda r: r.end_time.date())
+
+    monthly_avg = df_daily.groupby(['ticker', 'month_end'])[['daily_turnover', 'illiquidity']].mean().reset_index()
+    monthly_avg.rename(columns={'month_end': 'factor_date', 
+                                'daily_turnover': 'avg_daily_turnover', 
+                                'illiquidity': 'avg_illiquidity',
+                                'volume': 'avg_volume'}, inplace=True)
+
+    last_adj_close = df_daily.groupby(['ticker', 'month_end']).last().reset_index()[['ticker', 'month_end', 'adj_close']]
+    last_adj_close.rename(columns={'month_end': 'factor_date'}, inplace=True)
+    monthly_avg = monthly_avg.merge(last_adj_close, on=['ticker', 'factor_date'], how='left')
+
+    monthly_avg['mom_12m'] = safe_momentum_calc(monthly_avg['adj_close'], 1, 12)
+    monthly_avg['mom_6m'] = safe_momentum_calc(monthly_avg['adj_close'], 1, 7)
+    monthly_avg['mom_3m'] = safe_momentum_calc(monthly_avg['adj_close'], 1, 4)
+
+    lag_map = {
+        'pct_change_1m': 1, 'pct_change_3m': 3, 'pct_change_6m': 6,
+        'pct_change_12m': 12, 'pct_change_24m': 24, 'pct_change_60m': 60
+    }
+
+    for factor_name, lag in lag_map.items():
+        monthly_avg[factor_name] = safe_pct_change(monthly_avg['adj_close'], lag)
+
+    return monthly_avg
 
 
 def load_daily_prices(engine, start_date, end_date):
-    print(f"Loading daily prices from {start_date} to {end_date}...")
     sql = """
     SELECT ticker, date, adj_close, close, shares_outstanding, volume, high, low
     FROM daily_prices
@@ -112,377 +230,340 @@ def load_daily_prices(engine, start_date, end_date):
     return df
 
 
-def calculate_kama(prices, n=10, fast=2, slow=30):
-    change = prices.diff(n).abs()
-    volatility = prices.diff().abs().rolling(window=n).sum()
-    er = change / volatility
-    er = er.replace([np.inf, -np.inf], np.nan)
-
-    sc_fast = 2 / (fast + 1)
-    sc_slow = 2 / (slow + 1)
-    sc = (er * (sc_fast - sc_slow) + sc_slow) ** 2
-    sc = sc.replace([np.inf, -np.inf], np.nan)
-
-    kama = pd.Series(index=prices.index, dtype=float)
-    kama.iloc[:n] = prices.iloc[:n].mean()
-    for i in range(n, len(prices)):
-        if pd.isna(sc.iloc[i]) or pd.isna(prices.iloc[i]) or pd.isna(kama.iloc[i - 1]):
-            kama.iloc[i] = np.nan
-        else:
-            kama.iloc[i] = kama.iloc[i - 1] + sc.iloc[i] * (prices.iloc[i] - kama.iloc[i - 1])
-    return kama
-
-
-def safe_momentum_calc(series, lag1, lag2):
-    prev1 = series.shift(lag1)
-    prev2 = series.shift(lag2)
-    valid = (prev2 != 0) & prev2.notna() & prev1.notna()
-    result = pd.Series(np.nan, index=series.index)
-    valid_idxs = valid[valid].index
-    result.loc[valid_idxs] = (prev1.loc[valid_idxs] / prev2.loc[valid_idxs] - 1) * 100
-    result = result.replace([np.inf, -np.inf], np.nan)
-    return result
-
-
-def safe_pct_change(s, lag):
-    prev = s.shift(lag)
-    valid = (prev != 0) & prev.notna()
-    result = pd.Series(np.nan, index=s.index)
-    valid_idxs = valid[valid].index
-    result.loc[valid_idxs] = ((s.loc[valid_idxs] - prev.loc[valid_idxs]) / prev.loc[valid_idxs]) * 100
-    result = result.replace([np.inf, -np.inf], np.nan)
-    return result
-
-
-def compute_indicators(df):
-    print("Computing technical indicators...")
-    df['date'] = pd.to_datetime(df['date'])
-    df['adjustment_ratio'] = df['adj_close'] / df['close']
-    df['adjustment_ratio'] = df['adjustment_ratio'].replace([np.inf, -np.inf], np.nan)
-
-    df['adj_high'] = df['high'] * df['adjustment_ratio']
-    df['adj_low'] = df['low'] * df['adjustment_ratio']
-
-    df['high_52w'] = df.groupby('ticker', observed=True)['adj_high'].transform(lambda x: x.rolling(252, min_periods=1).max())
-    df['high_52w'] = df['high_52w'].replace([np.inf, -np.inf], np.nan)
-
-    df['low_52w'] = df.groupby('ticker', observed=True)['adj_low'].transform(lambda x: x.rolling(252, min_periods=1).min())
-    df['low_52w'] = df['low_52w'].replace([np.inf, -np.inf], np.nan)
-
-    df['dist52hi'] = np.where(df['adj_close'] != 0, df['high_52w'] / df['adj_close'] - 1, np.nan)
-    df['dist52hi'] = df['dist52hi'].replace([np.inf, -np.inf], np.nan)
-
-    df['dist52lo'] = np.where(df['low_52w'] != 0, df['adj_close'] / df['low_52w'] - 1, np.nan)
-    df['dist52lo'] = df['dist52lo'].replace([np.inf, -np.inf], np.nan)
-
-    df['market_cap'] = df['adj_close'] * df['shares_outstanding']
-
-    df['typical_price'] = (df['adj_high'] + df['adj_low'] + df['adj_close']) / 3
-
-    def rolling_vwap(x):
-        pv = x['typical_price'] * x['volume']
-        vol_sum = x['volume'].rolling(10, min_periods=1).sum().replace(0, np.nan)
-        return pv.rolling(10, min_periods=1).sum().div(vol_sum)
-
-    df['vwap_10d'] = df.groupby('ticker', observed=True).apply(rolling_vwap, include_groups=False).reset_index(level=0, drop=True)
-
-    df['month'] = df['date'].dt.to_period('M')
-
-    def monthly_vwap(sub):
-        cum_vol = sub['volume'].cumsum().replace(0, np.nan)
-        cum_pv = (sub['typical_price'] * sub['volume']).cumsum()
-        return cum_pv.div(cum_vol)
-
-    df['vwap_mtd'] = df.groupby(['ticker', 'month'], observed=True).apply(monthly_vwap, include_groups=False).reset_index(level=[0, 1], drop=True)
-
-    df['sma_50d'] = df.groupby('ticker', observed=True)['adj_close'].transform(lambda x: x.rolling(50, min_periods=1).mean())
-    df['sma_200d'] = df.groupby('ticker', observed=True)['adj_close'].transform(lambda x: x.rolling(200, min_periods=1).mean())
-    df['ema_20d'] = df.groupby('ticker', observed=True)['adj_close'].transform(lambda x: x.ewm(span=20, adjust=False).mean())
-    df['ema_50d'] = df.groupby('ticker', observed=True)['adj_close'].transform(lambda x: x.ewm(span=50, adjust=False).mean())
-    df['ema_100d'] = df.groupby('ticker', observed=True)['adj_close'].transform(lambda x: x.ewm(span=100, adjust=False).mean())
-    df['ema_200d'] = df.groupby('ticker', observed=True)['adj_close'].transform(lambda x: x.ewm(span=200, adjust=False).mean())
-
-    df['kama_10'] = df.groupby('ticker', observed=True)['adj_close'].transform(lambda x: calculate_kama(x, n=10, fast=2, slow=20))
-    df['kama_50'] = df.groupby('ticker', observed=True)['adj_close'].transform(lambda x: calculate_kama(x, n=50, fast=4, slow=50))
-
-    df['daily_turnover'] = np.where(df['shares_outstanding'] != 0, df['volume'] / df['shares_outstanding'], np.nan)
-    df['daily_turnover'] = df['daily_turnover'].replace([np.inf, -np.inf], np.nan)
-
-    df['daily_return'] = df.groupby('ticker', observed=True)['adj_close'].pct_change(fill_method=None)
-    df['daily_return'] = df['daily_return'].replace([np.inf, -np.inf], np.nan)
-
-    mask_invalid = (~np.isfinite(df['daily_return'])) | (df['daily_return'] == 0)
-    df['illiquidity'] = np.where(mask_invalid, np.nan, 1 / df['daily_return'].abs())
-    df['illiquidity'] = df['illiquidity'].replace([np.inf, -np.inf], np.nan)
-
-    df['prev_close'] = df.groupby('ticker', observed=True)['adj_close'].shift(1)
-    df['tr1'] = df['adj_high'] - df['adj_low']
-    df['tr2'] = (df['adj_high'] - df['prev_close']).abs()
-    df['tr3'] = (df['adj_low'] - df['prev_close']).abs()
-    df['true_range'] = df[['tr1', 'tr2', 'tr3']].max(axis=1)
-    df['atr_14d'] = df.groupby('ticker', observed=True)['true_range'].transform(lambda x: x.rolling(14, min_periods=14).mean())
-    df['atr_14d'] = df['atr_14d'].replace([np.inf, -np.inf], np.nan)
-
-    df['range_volatility'] = np.where(df['adj_close'] != 0, (df['adj_high'] - df['adj_low']) / df['adj_close'], np.nan)
-    df['range_volatility'] = df['range_volatility'].replace([np.inf, -np.inf], np.nan)
-
-    df['std_30d'] = df.groupby('ticker', observed=True)['adj_close'].transform(lambda x: x.rolling(30, min_periods=20).std())
-    df['std_3m'] = df.groupby('ticker', observed=True)['adj_close'].transform(lambda x: x.rolling(63, min_periods=45).std())
-    df['std_6m'] = df.groupby('ticker', observed=True)['adj_close'].transform(lambda x: x.rolling(126, min_periods=90).std())
-    df['std_12m'] = df.groupby('ticker', observed=True)['adj_close'].transform(lambda x: x.rolling(252, min_periods=182).std())
-
-    return df
-
-
-def compute_monthly_factors(df_daily):
-    print("Computing monthly factors...")
-    df_daily['month_end'] = df_daily['date'].dt.to_period('M').apply(lambda r: r.end_time.date())
-
-    monthly_avg = df_daily.groupby(['ticker', 'month_end'], observed=True)[['daily_turnover', 'illiquidity']].mean().reset_index()
-
-    monthly_avg = monthly_avg.rename(columns={
-        'month_end': 'factor_date',
-        'daily_turnover': 'avg_daily_turnover',
-        'illiquidity': 'avg_illiquidity'
-    })
-
-    last_adj_close = df_daily.groupby(['ticker', 'month_end'], observed=True).last().reset_index()[['ticker', 'month_end', 'adj_close']]
-    last_adj_close.rename(columns={'month_end': 'factor_date'}, inplace=True)
-
-    monthly_avg = monthly_avg.merge(last_adj_close, on=['ticker', 'factor_date'], how='left')
-
-    monthly_avg['mom_12m'] = safe_momentum_calc(monthly_avg['adj_close'], 1, 12).replace([np.inf, -np.inf], np.nan)
-    monthly_avg['mom_6m'] = safe_momentum_calc(monthly_avg['adj_close'], 1, 7).replace([np.inf, -np.inf], np.nan)
-    monthly_avg['mom_3m'] = safe_momentum_calc(monthly_avg['adj_close'], 1, 4).replace([np.inf, -np.inf], np.nan)
-
-    lags = {
-        'pct_change_1m': 1,
-        'pct_change_3m': 3,
-        'pct_change_6m': 6,
-        'pct_change_12m': 12,
-        'pct_change_24m': 24,
-        'pct_change_60m': 60
-    }
-    for name, lag in lags.items():
-        monthly_avg[name] = safe_pct_change(monthly_avg['adj_close'], lag).replace([np.inf, -np.inf], np.nan)
-
-    return monthly_avg
-
-
-def prepare_factor_df(df, factor_names, date_col='date'):
-    print("Preparing factor DataFrame for upsert...")
-    cols = ['ticker', date_col] + factor_names
-    df_factor = df[cols].copy()
-
-    df_melted = df_factor.melt(
-        id_vars=['ticker', date_col],
-        var_name='factor_name',
-        value_name='factor_value'
-    )
-
-    if date_col != 'factor_date':
-        df_melted = df_melted.rename(columns={date_col: 'factor_date'})
-    return df_melted
-
-
-def optimize_df_memory(df):
-    # Downcast numeric columns
-    for col in df.select_dtypes(include=['float64']).columns:
-        df[col] = pd.to_numeric(df[col], downcast='float')
-    for col in df.select_dtypes(include=['int64']).columns:
-        df[col] = pd.to_numeric(df[col], downcast='integer')
-    # Convert object columns with few unique values to categorical
-    for col in df.select_dtypes(include=['object']).columns:
-        num_unique = df[col].nunique()
-        total = len(df[col])
-        if num_unique / total < 0.5:
-            df[col] = df[col].astype('category')
-
-
 def process_factor_df_in_chunks(conn, df, factor_names, date_col='date',
-                               staging_table='staging_daily_factors',
                                target_table='daily_factors',
                                conflict_cols=['ticker', 'factor_date', 'factor_name'],
                                update_cols=['factor_value'],
-                               use_staging=True):
-    """
-    Process the dataframe month-by-month with progress bar,
-    clearing staging table before each load and dropping duplicate keys.
-    """
+                               db_params=None,
+                               factor_group_name=""):
+
     df[date_col] = pd.to_datetime(df[date_col])
     months = df[date_col].dt.to_period('M').sort_values().unique()
 
-    for month_period in tqdm(months, desc='Processing months'):
-        df_month = df[df[date_col].dt.to_period('M') == month_period]
-        if df_month.empty:
+    batch_size = 1  # 1 month per batch for controlled memory and progress tracking
+    batched_months = [months[i:i+batch_size] for i in range(0, len(months), batch_size)]
+
+    for month_batch in tqdm(batched_months, desc=f'Processing {factor_group_name} month batches'):
+        df_batch = df[df[date_col].dt.to_period('M').isin(month_batch)]
+        if df_batch.empty:
             continue
-
+        
         cols = ['ticker', date_col] + factor_names
-        df_factor = df_month[cols].copy()
-
-        df_melted = df_factor.melt(id_vars=['ticker', date_col],
-                                   var_name='factor_name',
-                                   value_name='factor_value',
-                                   ignore_index=True)
-
+        df_factor = df_batch[cols].copy()
+        df_melted = df_factor.melt(id_vars=['ticker', date_col], var_name='factor_name', value_name='factor_value')
         if date_col != 'factor_date':
             df_melted.rename(columns={date_col: 'factor_date'}, inplace=True)
 
-        # Drop duplicates to avoid unique constraint violation on bulk insert
         df_melted.drop_duplicates(subset=['ticker', 'factor_date', 'factor_name'], inplace=True)
+        df_melted.dropna(subset=['ticker'], inplace=True)
+        df_melted.sort_values(by=['ticker', 'factor_date', 'factor_name'], inplace=True)
 
-        null_tickers = df_melted['ticker'].isnull().sum()
-        if null_tickers > 0:
-            print(f"Warning: Dropping {null_tickers} rows with NULL tickers before bulk copy.")
-            df_melted.dropna(subset=['ticker'], inplace=True)
+        safe_month = "_".join(str(m) for m in month_batch).replace('-', '_')
+        temp_table = f"temp_upsert_{safe_month}"
 
-        if use_staging:
-            # Clear staging table before bulk copy to prevent duplicates
-            clear_staging_table(conn, staging_table)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SET maintenance_work_mem = '256MB';")
+                cur.execute("SET synchronous_commit = OFF;")
+                cur.execute("SET temp_buffers = '16MB';")
+                cur.execute(f"CREATE TEMP TABLE {temp_table} (LIKE {target_table} INCLUDING DEFAULTS) ON COMMIT DROP;")
 
-            # Bulk copy data into staging
-            bulk_copy_from_df(conn, df_melted, staging_table)
+                f = io.BytesIO()
+                csv_bytes = df_melted.to_csv(sep='\t', header=False, index=False, na_rep='\\N').encode('utf-8')
+                f.write(csv_bytes)
+                f.seek(0)
+                cur.copy_from(f, temp_table, null='\\N', sep='\t')
 
-            # Upsert into target table from staging
-            upsert_from_staging(conn, staging_table, target_table, conflict_cols, update_cols)
+                updates = ', '.join([f"{col} = EXCLUDED.{col}" for col in update_cols])
+                conflict_keys = ', '.join(conflict_cols)
 
-            # Clear staging table after successful upsert
-            clear_staging_table(conn, staging_table)
-        else:
-            print(f"Staging disabled for month {month_period}, skipping DB operations.")
+                upsert_sql = f"""
+                    INSERT INTO {target_table} (ticker, factor_date, factor_name, factor_value)
+                    SELECT ticker, factor_date, factor_name, factor_value FROM {temp_table}
+                    ON CONFLICT ({conflict_keys}) DO UPDATE SET {updates};
+                """
+                cur.execute(upsert_sql)
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            print(f"Error in bulk upsert for months {month_batch}: {e}")
+            raise
 
-        del df_month, df_factor, df_melted
+        del df_batch, df_factor, df_melted
         gc.collect()
 
+def worker_upsert(df_chunk, factor_names, date_col, target_table, conflict_cols, update_cols, db_params, factor_group_name):
+    conn = psycopg2.connect(**db_params)
+    try:
+        process_factor_df_in_chunks(conn, df_chunk, factor_names, date_col, target_table,
+                                   conflict_cols, update_cols, db_params, factor_group_name)
+    finally:
+        conn.close()
 
-def run_full_update(conn, engine, start_date, end_date, use_staging=True):
-    print(f"Starting full update from {start_date} to {end_date}...")
+def parallel_process_factor_df_in_chunks(df, factor_names, date_col='date',
+                                        target_table='daily_factors',
+                                        conflict_cols=['ticker', 'factor_date', 'factor_name'],
+                                        update_cols=['factor_value'],
+                                        db_params=None,
+                                        n_jobs=None,
+                                        factor_group_name=""):
+    if n_jobs is None:
+        n_jobs = max(mp.cpu_count() - 1, 1)
 
-    df_daily = load_daily_prices(engine, start_date, end_date)
-    df_indicators = compute_indicators(df_daily)
+    unique_tickers = df['ticker'].unique()
+    chunks = np.array_split(unique_tickers, n_jobs)
+    df_chunks = [df[df['ticker'].isin(tickers)].copy() for tickers in chunks]
 
-    factors_daily = [
-        'adj_close', 'market_cap', 'dist52hi', 'dist52lo', 'vwap_10d', 'vwap_mtd',
-        'sma_50d', 'sma_200d', 'ema_20d', 'ema_50d', 'ema_100d', 'ema_200d',
-        'kama_10', 'kama_50', 'daily_turnover', 'atr_14d', 'illiquidity',
-        'range_volatility', 'std_30d', 'std_3m', 'std_6m', 'std_12m'
-    ]
+    args = [(chunk, factor_names, date_col, target_table, conflict_cols, update_cols, db_params, factor_group_name) for chunk in df_chunks]
 
-    # Upload daily factors
-    process_factor_df_in_chunks(conn, df_indicators, factors_daily, date_col='date', use_staging=use_staging)
-    print("Daily factors upsert complete.")
+    with mp.Pool(n_jobs) as pool:
+        list(tqdm(pool.starmap(worker_upsert, args), total=len(args), desc=f'Parallel upsert {factor_group_name}'))
 
-    # Compute monthly factors
-    df_monthly = compute_monthly_factors(df_daily)
-    factors_monthly = [
-        'avg_daily_turnover', 'avg_illiquidity', 'adj_close', 'mom_12m', 'mom_6m', 'mom_3m',
-        'pct_change_1m', 'pct_change_3m', 'pct_change_6m', 'pct_change_12m', 'pct_change_24m', 'pct_change_60m'
-    ]
+# The monthly equivalents can be similarly updated, here is the monthly factor chunk processing:
 
-    # Upload monthly factors with progress and staging
-    process_factor_df_in_chunks(conn, df_monthly, factors_monthly, date_col='factor_date',
-                               staging_table='staging_monthly_factors',
-                               target_table='monthly_factors',
-                               conflict_cols=['ticker', 'factor_date', 'factor_name'],
-                               update_cols=['factor_value'],
-                               use_staging=use_staging)
-    print("Monthly factors upsert complete.")
+def process_monthly_factor_df_in_chunks(conn, df, factor_names, date_col='factor_date',
+                                       target_table='monthly_factors',
+                                       conflict_cols=['ticker', 'factor_date', 'factor_name'],
+                                       update_cols=['factor_value'],
+                                       db_params=None,
+                                       factor_group_name=""):
+
+    df[date_col] = pd.to_datetime(df[date_col])
+    months = df[date_col].dt.to_period('M').sort_values().unique()
+
+    batch_size = 1
+    batched_months = [months[i:i+batch_size] for i in range(0, len(months), batch_size)]
+
+    for month_batch in tqdm(batched_months, desc=f'Processing {factor_group_name} monthly batches'):
+        df_batch = df[df[date_col].dt.to_period('M').isin(month_batch)]
+        if df_batch.empty:
+            continue
+
+        cols = ['ticker', date_col] + factor_names
+        df_factor = df_batch[cols].copy()
+        df_melted = df_factor.melt(id_vars=['ticker', date_col], var_name='factor_name', value_name='factor_value')
+        if date_col != 'factor_date':
+            df_melted.rename(columns={date_col: 'factor_date'}, inplace=True)
+
+        df_melted.drop_duplicates(subset=['ticker', 'factor_date', 'factor_name'], inplace=True)
+        df_melted.dropna(subset=['ticker'], inplace=True)
+        df_melted.sort_values(by=['ticker', 'factor_date', 'factor_name'], inplace=True)
+
+        safe_month = "_".join(str(m) for m in month_batch).replace('-', '_')
+        temp_table = f"temp_upsert_monthly_{safe_month}"
+
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SET maintenance_work_mem = '256MB';")
+                cur.execute("SET synchronous_commit = OFF;")
+                cur.execute("SET temp_buffers = '16MB';")
+                cur.execute(f"CREATE TEMP TABLE {temp_table} (LIKE {target_table} INCLUDING DEFAULTS) ON COMMIT DROP;")
+
+                f = io.BytesIO()
+                csv_bytes = df_melted.to_csv(sep='\t', header=False, index=False, na_rep='\\N').encode('utf-8')
+                f.write(csv_bytes)
+                f.seek(0)
+                cur.copy_from(f, temp_table, null='\\N', sep='\t')
+
+                updates = ', '.join([f"{col} = EXCLUDED.{col}" for col in update_cols])
+                conflict_keys = ', '.join(conflict_cols)
+
+                upsert_sql = f"""
+                    INSERT INTO {target_table} (ticker, factor_date, factor_name, factor_value)
+                    SELECT ticker, factor_date, factor_name, factor_value FROM {temp_table}
+                    ON CONFLICT ({conflict_keys}) DO UPDATE SET {updates};
+                """
+                cur.execute(upsert_sql)
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            print(f"Error in bulk upsert for monthly batch {month_batch}: {e}")
+            raise
+
+        del df_batch, df_factor, df_melted
+        gc.collect()
+
+def worker_monthly_upsert(df_chunk, factor_names, date_col, target_table, conflict_cols, update_cols, db_params, factor_group_name):
+    import psycopg2
+    conn = psycopg2.connect(**db_params)
+    try:
+        process_monthly_factor_df_in_chunks(conn, df_chunk, factor_names, date_col, target_table,
+                                           conflict_cols, update_cols, db_params, factor_group_name)
+    finally:
+        conn.close()
+
+def parallel_process_monthly_factor_df_in_chunks(df, factor_names, date_col='factor_date',
+                                                target_table='monthly_factors',
+                                                conflict_cols=['ticker', 'factor_date', 'factor_name'],
+                                                update_cols=['factor_value'],
+                                                db_params=None,
+                                                n_jobs=None,
+                                                factor_group_name=""):
+    if n_jobs is None:
+        n_jobs = max(mp.cpu_count() - 1, 1)
+
+    df[date_col] = pd.to_datetime(df[date_col])
+    months = df[date_col].dt.to_period('M').sort_values().unique()
+
+    batch_size = 1
+    batched_months = [months[i:i+batch_size] for i in range(0, len(months), batch_size)]
+
+    df_batches = [df[df[date_col].dt.to_period('M').isin(batch)].copy() for batch in batched_months]
+
+    args = [(batch, factor_names, date_col, target_table, conflict_cols, update_cols, db_params, factor_group_name)
+            for batch in df_batches if not batch.empty]
+
+    with mp.Pool(n_jobs) as pool:
+        list(tqdm(pool.starmap(worker_monthly_upsert, args), total=len(args), desc=f'Parallel monthly upsert {factor_group_name}'))
+
+
+def date_chunks(start_date, end_date, chunk_size_months=1):
+    current_start = start_date
+    while current_start <= end_date:
+        current_end = min(current_start + relativedelta(months=chunk_size_months) - timedelta(days=1), end_date)
+        yield current_start, current_end
+        current_start = current_end + timedelta(days=1)
+
+MAX_DAILY_LOOKBACK_MONTHS = 120  # extended to 6 years for monthly factor lookbacks
+MAX_MONTHLY_LOOKBACK_MONTHS = 84
+
+daily_factors = [
+    'adj_close', 'market_cap', 'dist52hi', 'dist52lo', 'vwap_10d', 'vwap_mtd',
+    'sma_50d', 'sma_200d', 'ema_20d', 'ema_50d', 'ema_100d', 'ema_200d',
+    'kama_10', 'kama_50', 'daily_turnover', 'atr_14d', 'illiquidity',
+    'range_volatility', 'std_30d', 'std_3m', 'std_6m', 'std_12m'
+]
+
+monthly_factors = [
+    'avg_daily_turnover', 'avg_illiquidity', 'adj_close', 'mom_12m', 'mom_6m', 'mom_3m',
+    'pct_change_1m', 'pct_change_3m', 'pct_change_6m', 'pct_change_12m', 'pct_change_24m', 'pct_change_60m'
+]
+
+
+def ensure_timestamp(dt):
+    if not isinstance(dt, pd.Timestamp):
+        return pd.Timestamp(dt)
+    return dt
+
+def run_full_update(conn, engine, start_date, end_date, db_params):
+    start_date = ensure_timestamp(start_date)
+    end_date = ensure_timestamp(end_date)
+
+    print(f"Starting full update from {start_date.date()} to {end_date.date()} in chunks...")
+    batch_period_months = 24
+
+    for chunk_start, chunk_end in date_chunks(start_date, end_date, chunk_size_months=batch_period_months):
+        chunk_start = ensure_timestamp(chunk_start)
+        chunk_end = ensure_timestamp(chunk_end)
+
+        extended_daily_start = max(chunk_start - relativedelta(months=MAX_DAILY_LOOKBACK_MONTHS), pd.Timestamp('2000-01-01'))
+        print(f"Loading daily prices from {extended_daily_start.date()} to {chunk_end.date()} ...")
+
+        df_daily = load_daily_prices(engine, extended_daily_start, chunk_end)
+        df_indicators_full = compute_indicators(df_daily)
+
+        df_indicators = df_indicators_full[df_indicators_full['date'] >= chunk_start]
+
+        print("Starting daily factors upsert...")
+        parallel_process_factor_df_in_chunks(
+            df_indicators, daily_factors, date_col='date',
+            target_table='daily_factors',
+            conflict_cols=['ticker', 'factor_date', 'factor_name'],
+            update_cols=['factor_value'], db_params=db_params,
+            factor_group_name="daily factors"
+        )
+        print("Daily factors upsert complete.")
+
+        extended_monthly_start = max(chunk_start - relativedelta(months=MAX_MONTHLY_LOOKBACK_MONTHS), pd.Timestamp('2000-01-01'))
+        df_daily_for_monthly = df_indicators_full[df_indicators_full['date'] >= extended_monthly_start]
+
+        df_monthly = compute_monthly_factors(df_daily_for_monthly)
+        df_monthly['factor_date'] = pd.to_datetime(df_monthly['factor_date'])
+
+        df_monthly_filtered = df_monthly[(df_monthly['factor_date'] >= chunk_start) & (df_monthly['factor_date'] <= chunk_end)]
+
+        print(f"Starting monthly factors upsert for chunk {chunk_start.date()} to {chunk_end.date()}...")
+        parallel_process_factor_df_in_chunks(
+            df_monthly_filtered, monthly_factors, date_col='factor_date',
+            target_table='monthly_factors',
+            conflict_cols=['ticker', 'factor_date', 'factor_name'],
+            update_cols=['factor_value'], db_params=db_params,
+            factor_group_name=f"monthly factors chunk {chunk_start.date()} to {chunk_end.date()}"
+        )
+        print("Monthly factors upsert complete for chunk.")
     print("Full update complete.")
 
 
-def run_incremental_update(conn, engine, since_date, use_staging=True):
-    print("Starting incremental update...")
+def run_incremental_update(conn, engine, start_date, end_date, db_params):
+    batch_start = ensure_timestamp(start_date)
+    batch_end = ensure_timestamp(end_date)
 
-    df_daily = load_daily_prices(engine, since_date, date.today())
-    df_indicators = compute_indicators(df_daily)
+    extended_daily_start = max(batch_start - relativedelta(months=MAX_DAILY_LOOKBACK_MONTHS), pd.Timestamp('2000-01-01'))
+    print(f"Loading daily prices from {extended_daily_start.date()} to {batch_end.date()} ...")
 
-    factors_daily = [
-        'adj_close', 'market_cap', 'dist52hi', 'dist52lo', 'vwap_10d', 'vwap_mtd',
-        'sma_50d', 'sma_200d', 'ema_20d', 'ema_50d', 'ema_100d', 'ema_200d',
-        'kama_10', 'kama_50', 'daily_turnover', 'atr_14d', 'illiquidity',
-        'range_volatility', 'std_30d', 'std_3m', 'std_6m', 'std_12m'
-    ]
+    df_daily = load_daily_prices(engine, extended_daily_start, batch_end)
+    df_indicators_full = compute_indicators(df_daily)
 
-    # Upload daily factors incrementally
-    process_factor_df_in_chunks(conn, df_indicators, factors_daily, date_col='date', use_staging=use_staging)
+    df_indicators = df_indicators_full[df_indicators_full['date'] >= batch_start]
 
-    # Compute monthly factors
-    df_monthly = compute_monthly_factors(df_daily)
-    factors_monthly = [
-        'avg_daily_turnover', 'avg_illiquidity', 'adj_close', 'mom_12m', 'mom_6m', 'mom_3m',
-        'pct_change_1m', 'pct_change_3m', 'pct_change_6m', 'pct_change_12m', 'pct_change_24m', 'pct_change_60m'
-    ]
+    print("Starting incremental daily factors upsert...")
+    parallel_process_factor_df_in_chunks(
+        df_indicators, daily_factors, date_col='date',
+        target_table='daily_factors',
+        conflict_cols=['ticker', 'factor_date', 'factor_name'],
+        update_cols=['factor_value'], db_params=db_params,
+        factor_group_name="incremental daily factors"
+    )
+    print("Incremental daily factors upsert complete.")
 
-    # Upload monthly factors incrementally
-    process_factor_df_in_chunks(conn, df_monthly, factors_monthly, date_col='factor_date',
-                               staging_table='staging_monthly_factors',
-                               target_table='monthly_factors',
-                               conflict_cols=['ticker', 'factor_date', 'factor_name'],
-                               update_cols=['factor_value'],
-                               use_staging=use_staging)
+    latest_month = batch_end.to_period('M').to_timestamp()
+    extended_monthly_start = max(latest_month - relativedelta(months=MAX_MONTHLY_LOOKBACK_MONTHS), pd.Timestamp('2000-01-01'))
 
+    df_daily_for_monthly = df_indicators_full[df_indicators_full['date'] >= extended_monthly_start]
+
+    df_monthly = compute_monthly_factors(df_daily_for_monthly)
+    df_monthly['factor_date'] = pd.to_datetime(df_monthly['factor_date'])
+
+    df_monthly_filtered = df_monthly[(df_monthly['factor_date'] >= latest_month) & (df_monthly['factor_date'] <= batch_end)]
+
+    print(f"Starting monthly factors upsert for latest month {latest_month.date()} ...")
+    parallel_process_factor_df_in_chunks(
+        df_monthly_filtered, monthly_factors, date_col='factor_date',
+        target_table='monthly_factors',
+        conflict_cols=['ticker', 'factor_date', 'factor_name'],
+        update_cols=['factor_value'], db_params=db_params,
+        factor_group_name="incremental monthly factors"
+    )
+    print("Incremental monthly factors upsert complete.")
     print("Incremental update complete.")
 
 
-def run_daily_incremental_update(conn, engine, use_staging=True):
-    update_day = datetime.today().date() - timedelta(days=1)
-    lookback_days = 252
-    extended_start = update_day - timedelta(days=lookback_days)
-    print(f"Running daily factors update for {update_day} with lookback from {extended_start}...")
+def run_daily_incremental_update(conn, engine, db_params):
+    update_day = ensure_timestamp(datetime.today().date() - timedelta(days=5))
+    batch_start = ensure_timestamp(update_day - relativedelta(years=1))
 
-    df_daily = load_daily_prices(engine, extended_start, update_day)
-    df_indicators = compute_indicators(df_daily)
+    extended_daily_start = max(batch_start - relativedelta(months=MAX_DAILY_LOOKBACK_MONTHS), pd.Timestamp('2000-01-01'))
+    print(f"Loading daily prices from {extended_daily_start.date()} to {update_day.date()} ...")
 
-    factors_daily = [
-        'adj_close', 'market_cap', 'dist52hi', 'dist52lo', 'vwap_10d', 'vwap_mtd',
-        'sma_50d', 'sma_200d', 'ema_20d', 'ema_50d', 'ema_100d', 'ema_200d',
-        'kama_10', 'kama_50', 'daily_turnover', 'atr_14d', 'illiquidity',
-        'range_volatility', 'std_30d', 'std_3m', 'std_6m', 'std_12m'
-    ]
+    df_daily = load_daily_prices(engine, extended_daily_start, update_day)
+    df_indicators_full = compute_indicators(df_daily)
 
-    # Upload daily factors incrementally
-    process_factor_df_in_chunks(conn, df_indicators, factors_daily, date_col='date', use_staging=use_staging)
+    df_indicators = df_indicators_full[df_indicators_full['date'] >= batch_start]
 
-    # Compute monthly factors
-    df_monthly = compute_monthly_factors(df_daily)
-    factors_monthly = [
-        'avg_daily_turnover', 'avg_illiquidity', 'adj_close', 'mom_12m', 'mom_6m', 'mom_3m',
-        'pct_change_1m', 'pct_change_3m', 'pct_change_6m', 'pct_change_12m', 'pct_change_24m', 'pct_change_60m'
-    ]
-
-    # Upload monthly factors incrementally
-    process_factor_df_in_chunks(conn, df_monthly, factors_monthly, date_col='factor_date',
-                               staging_table='staging_monthly_factors',
-                               target_table='monthly_factors',
-                               conflict_cols=['ticker', 'factor_date', 'factor_name'],
-                               update_cols=['factor_value'],
-                               use_staging=use_staging)
-
-    print("Daily factors incremental upsert complete.")
-
-
-
+    print("Starting daily incremental factors upsert...")
+    parallel_process_factor_df_in_chunks(
+        df_indicators, daily_factors, date_col='date',
+        target_table='daily_factors',
+        conflict_cols=['ticker', 'factor_date', 'factor_name'],
+        update_cols=['factor_value'], db_params=db_params,
+        factor_group_name="daily incremental factors"
+    )
+    print("Daily incremental factors upsert complete.")
 
 if __name__ == "__main__":
-    # parser = argparse.ArgumentParser(description='Run factor model updates with optional staging and date control.')
-    # parser.add_argument('--start_date', type=lambda s: datetime.strptime(s, '%Y-%m-%d').date(),
-    #                     default=date(2000, 1, 1), help='Start date YYYY-MM-DD (default: 2000-01-01)')
-    # parser.add_argument('--end_date', type=lambda s: datetime.strptime(s, '%Y-%m-%d').date(),
-    #                     default=datetime.today().date(), help='End date YYYY-MM-DD (default: today)')
-    # parser.add_argument('--use_staging', action='store_true', help='Enable staging steps during processing')
-    # parser.add_argument('--mode', type=str, choices=['full', 'incremental'], default='full',
-    #                     help='Update mode: full or incremental (default: full)')
-
-    # args = parser.parse_args()
-    # start = args.start_date
-    # end = args.end_date
-    # use_staging = args.use_staging
-    # mode = args.mode
-    use_staging = False
     today = datetime.today().date()
-    start = date(2000, 1, 1)   # set your desired start date here
-    end = (today.replace(day=1) - timedelta(days=1))   # set your desired end date here
-    mode = decide_mode()              # set mode to 'full' or 'incremental' here
+    start = date(2000, 1, 1)
+    end = today
 
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
     config_path = os.path.join(project_root, 'config.yml')
@@ -492,26 +573,28 @@ if __name__ == "__main__":
     params = config['database']
     conn_str = f"postgresql+psycopg2://{params['user']}:{params['password']}@{params['host']}:{params['port']}/{params['dbname']}"
     engine = create_engine(conn_str)
-    conn = psycopg2.connect(
-        dbname=params['dbname'],
-        user=params['user'],
-        password=params['password'],
-        host=params['host'],
-        port=params['port']
-    )
+
+    db_connect_params = {
+        'dbname': params['dbname'],
+        'user': params['user'],
+        'password': params['password'],
+        'host': params['host'],
+        'port': params['port']
+    }
+
+    conn = psycopg2.connect(**db_connect_params)
     conn.set_client_encoding('UTF8')
 
     try:
+        mode = decide_mode()
+        # mode = 'full'  # Change as needed
         if mode == 'full':
-            # Adjust end date to last day of previous month if needed
-            end_adj = end.replace(day=1) - timedelta(days=1)
-            run_full_update(conn, engine, start, end_adj, use_staging=use_staging)
+            run_full_update(conn, engine, start, end, db_connect_params)
         elif mode == 'incremental':
-            since = start  # or computed from args or use start arg directly
-            run_incremental_update(conn, engine, since, use_staging=use_staging)
+            since_date = datetime.today().date() - relativedelta(months=24)
+            run_incremental_update(conn, engine, since_date, end, db_connect_params)
 
-        run_daily_incremental_update(conn, engine, use_staging=use_staging)
-
+        run_daily_incremental_update(conn, engine, db_connect_params)
     finally:
         conn.close()
         print("DB connection closed.")

@@ -1,16 +1,24 @@
 import os
-import sys
 import yaml
 import psycopg2
 import psycopg2.extras
 from psycopg2 import pool
-import pandas as pd
+import io
 from sqlalchemy import create_engine
 from datetime import datetime, date, timedelta
 from dateutil.relativedelta import relativedelta
+import pandas as pd
 import concurrent.futures
+from tqdm import tqdm
+import numpy as np
+import csv
+from functools import partial
+import multiprocessing as mp 
 
-# Indicators list as you provided
+# --- Global Variables and Constants
+
+connection_pool = None
+
 indicators = [
     {
         'name': 'net_income',
@@ -413,18 +421,14 @@ def decide_mode(today=None):
     if today is None:
         today = date.today()
     yesterday = today - timedelta(days=1)
-
     month_changed = yesterday.month != today.month
-
     if today.weekday() == 1:  # Tuesday
         saturday = today - timedelta(days=3)
         sunday = today - timedelta(days=2)
         monday = today - timedelta(days=1)
         month_changed = any(d.month != today.month for d in [saturday, sunday, monday])
-
     if not month_changed:
         return None
-
     if today.weekday() == 1:  # Tuesday
         for day in [monday, sunday, saturday]:
             if day.month != today.month:
@@ -432,21 +436,15 @@ def decide_mode(today=None):
                 break
     else:
         month_change_day = yesterday
-
     if (month_change_day.month == 1 or month_change_day.month == 7) and month_change_day.weekday() == 4 and 1 <= month_change_day.day <= 7:
         return "full"
-
     return "incremental"
-
-# Connection pool setup
-connection_pool = None
 
 def init_connection_pool(conn_params):
     global connection_pool
     if connection_pool is None:
         connection_pool = pool.ThreadedConnectionPool(
-            minconn=1,
-            maxconn=10,
+            minconn=2, maxconn=10,
             dbname=conn_params['dbname'],
             user=conn_params['user'],
             password=conn_params['password'],
@@ -463,7 +461,12 @@ def put_conn_back(conn):
 def close_connection_pool():
     global connection_pool
     if connection_pool:
-        connection_pool.closeall()
+        try:
+            connection_pool.closeall()
+        except psycopg2.pool.PoolError:
+            # Pool already closed, ignore
+            pass
+        connection_pool = None
 
 def safe_div(a, b):
     if b in (None, 0) or a in (None, 0):
@@ -485,8 +488,8 @@ def get_monthly_eom_dates(start, end):
         current = nxt
     return dates
 
+
 def build_flow_factor(conn, factor_date, indicator):
-    # Calculate trailing twelve month sum ending at factor_date (monthly point in time)
     sql = f"""
         WITH ttm_value AS (
             SELECT ticker, SUM({indicator['name']}) AS value
@@ -560,9 +563,18 @@ def build_factor_generic(conn, factor_date, indicator):
         raise ValueError(f"Unknown indicator type: {indicator['type']}")
 
 
+def process_indicator_for_date(conn_params, factor_date, indicator):
+    conn = get_conn_from_pool()
+    try:
+        build_factor_generic(conn, factor_date, indicator)
+        conn.commit()
+    finally:
+        put_conn_back(conn)
 
-def compute_and_upsert_extended_factors(conn, factor_date, engine, indicators):
-    print(f"Computing extended factors for date {factor_date}...")
+
+def compute_and_upsert_extended_factors(conn, factor_date, extended_start):
+    print(f" Computing extended factors for {factor_date.strftime('%Y-%m-%d')}...")
+
     sql_fetch = """
         SELECT ticker,
                MAX(CASE WHEN factor_name = 'adj_close' THEN factor_value END) AS adj_close,
@@ -587,7 +599,7 @@ def compute_and_upsert_extended_factors(conn, factor_date, engine, indicators):
                MAX(CASE WHEN factor_name = 'ttm_cos' THEN factor_value END) AS ttm_cos,
                MAX(CASE WHEN factor_name = 'ttm_div' THEN factor_value END) AS ttm_div
         FROM monthly_factors
-        WHERE factor_date = %s
+        WHERE factor_date = %s AND factor_date >= %s
         GROUP BY ticker
     """
 
@@ -598,7 +610,7 @@ def compute_and_upsert_extended_factors(conn, factor_date, engine, indicators):
     """
 
     with conn.cursor() as cur:
-        cur.execute(sql_fetch, (factor_date,))
+        cur.execute(sql_fetch, (factor_date, extended_start))
         rows = cur.fetchall()
         columns = [desc[0] for desc in cur.description]
 
@@ -609,7 +621,6 @@ def compute_and_upsert_extended_factors(conn, factor_date, engine, indicators):
     market_cap_dict = {r[0]: r[1] for r in market_cap_rows}
 
     extended_rows = []
-
     for _, row in df.iterrows():
         ticker = row['ticker']
         market_cap = market_cap_dict.get(ticker)
@@ -701,7 +712,6 @@ def compute_and_upsert_extended_factors(conn, factor_date, engine, indicators):
         if row['long_term_debt'] is not None and row['short_term_debt'] is not None and row['ttm_cash_flows'] not in (None, 0) and row['ttm_capex'] not in (None, 0) and row['cash_and_equiv'] not in (None, 0):
             yrs_to_cash = safe_div(row['long_term_debt'] + row['short_term_debt'] - row['cash_and_equiv'], (row['ttm_cash_flows'] - row['ttm_capex']))
 
-        div_cover = None
         div_cover = safe_div(row['ttm_div'], row['ttm_net_income'])
 
         factors = {
@@ -729,6 +739,8 @@ def compute_and_upsert_extended_factors(conn, factor_date, engine, indicators):
         for factor_name, factor_value in factors.items():
             extended_rows.append((ticker, factor_date, factor_name, factor_value))
 
+    print(f"Upserting {len(extended_rows)} extended factor records for date {factor_date}...")
+
     insert_sql = """
         INSERT INTO monthly_factors (ticker, factor_date, factor_name, factor_value)
         VALUES %s
@@ -741,25 +753,27 @@ def compute_and_upsert_extended_factors(conn, factor_date, engine, indicators):
         conn.commit()
 
 
-def compute_and_upsert_growth_factors(conn, engine, lookbacks=[12, 60]):
-    print("Computing growth factors for all months...")
+def compute_and_upsert_extended_factors_batch(conn_params, engine_params, indicators, factor_dates, extended_start):
+    engine = create_engine(
+        f"postgresql+psycopg2://{engine_params['user']}:{engine_params['password']}@"
+        f"{engine_params['host']}:{engine_params['port']}/{engine_params['dbname']}"
+    )
+    conn = psycopg2.connect(**conn_params)
+    try:
+        for factor_date in factor_dates:
+            for indicator in indicators:
+                build_factor_generic(conn, factor_date, indicator)
+            compute_and_upsert_extended_factors(conn, factor_date, extended_start)
+            conn.commit()
+    finally:
+        conn.close()
+
+
+def compute_and_upsert_growth_factors(conn, engine, factor_date, max_lookback_months=84):
+    print(f"Computing growth factors for {factor_date.strftime('%Y-%m-%d')}...")
     factors_to_grow = ['ttm_sales', 'ttm_fcf', 'ttm_net_income', 'ttm_eps', 'ttm_div', 'shares_diluted']
 
-    sql_date_range = """
-        SELECT MIN(factor_date), MAX(factor_date)
-        FROM monthly_factors
-        WHERE factor_name = ANY(%s)
-    """
-    with conn.cursor() as cur:
-        cur.execute(sql_date_range, (factors_to_grow,))
-        range_min, range_max = cur.fetchone()
-
-    if range_min is None or range_max is None:
-        print("No data found to compute growth factors.")
-        return
-
-    start_date = pd.to_datetime(range_min)
-    end_date = pd.to_datetime(range_max)
+    start_date = factor_date - relativedelta(months=max_lookback_months)
 
     sql_fetch = """
         SELECT ticker, factor_date, factor_name, factor_value
@@ -767,26 +781,25 @@ def compute_and_upsert_growth_factors(conn, engine, lookbacks=[12, 60]):
         WHERE factor_name = ANY(%s)
           AND factor_date BETWEEN %s AND %s
     """
-    df = pd.read_sql(sql_fetch, con=engine, params=(factors_to_grow, start_date, end_date))
+    df = pd.read_sql(sql_fetch, con=engine, params=(factors_to_grow, start_date, factor_date))
     df['factor_date'] = pd.to_datetime(df['factor_date'])
 
-    def resample_group(group):
-        ticker, factor_name = group.name
-        group = group.set_index('factor_date').resample('ME').ffill().reset_index()
-        group['ticker'] = ticker
-        group['factor_name'] = factor_name
+    if df.empty:
+        print(f"No factor data found between {start_date} and {factor_date} for growth calculation.")
+        return
+
+    def resample_forward_fill(group):
+        group = group.set_index('factor_date').resample('ME').ffill()
+        group['ticker'] = group['ticker'].iloc[0]
+        group['factor_name'] = group['factor_name'].iloc[0]
         return group
 
-    df_monthly = df.groupby(['ticker', 'factor_name'], group_keys=False)[['factor_date', 'factor_value']]\
-                   .apply(resample_group)\
-                   .reset_index(drop=True)
+    df_monthly = df.groupby(['ticker', 'factor_name'], group_keys=False).apply(resample_forward_fill, include_groups=False).reset_index()
 
-    if 'ticker' not in df_monthly.columns or 'factor_name' not in df_monthly.columns:
-        raise ValueError("Grouping columns missing after reset_index")
-
+    lookbacks = [12, 60]
     results = []
+
     for factor in factors_to_grow:
-        print(f"  Processing growth for factor: {factor}")
         df_factor = df_monthly[df_monthly['factor_name'] == factor].copy()
         df_factor.sort_values(['ticker', 'factor_date'], inplace=True)
 
@@ -794,41 +807,201 @@ def compute_and_upsert_growth_factors(conn, engine, lookbacks=[12, 60]):
             lag_col = f'lag_{lookback}'
             df_factor[lag_col] = df_factor.groupby('ticker')['factor_value'].shift(lookback)
 
-            valid_mask = (
-                df_factor[lag_col].notna() &
-                df_factor['factor_value'].notna() &
-                (df_factor[lag_col] > 0)
+        valid_mask = pd.Series(False, index=df_factor.index)
+        for lookback in lookbacks:
+            lag_col = f'lag_{lookback}'
+            valid_mask |= (df_factor[lag_col].notna() & df_factor['factor_value'].notna() & (df_factor[lag_col] != 0))
+
+        df_valid = df_factor[valid_mask]
+
+        for lookback in lookbacks:
+            lag_col = f'lag_{lookback}'
+            mask = df_valid[lag_col].notna() & (df_valid[lag_col] != 0)
+            df_tmp = df_valid[mask]
+
+            growth_values = (df_tmp['factor_value'] - df_tmp[lag_col]) / df_tmp[lag_col]
+            growth_values = growth_values.replace([np.inf, -np.inf], np.nan).dropna()
+
+            if growth_values.empty:
+                continue
+
+            factor_results = list(
+                zip(
+                    df_tmp.loc[growth_values.index, 'ticker'],
+                    df_tmp.loc[growth_values.index, 'factor_date'].dt.strftime('%Y-%m-%d'),
+                    [f"{factor}_growth_{lookback}m"] * len(growth_values),
+                    growth_values
+                )
             )
-
-            valid_rows = df_factor.loc[valid_mask]
-
-            growth_values = (valid_rows['factor_value'] - valid_rows[lag_col]) / valid_rows[lag_col]
-
-            # Prepare result tuples in a vectorized manner
-            factor_results = list(zip(
-                valid_rows['ticker'],
-                valid_rows['factor_date'],
-                [f"{factor}_growth_{lookback}m"] * len(valid_rows),
-                growth_values
-            ))
             results.extend(factor_results)
 
     if not results:
-        print("No growth factors computed for any month.")
+        print(f"No growth factors computed for factor_date {factor_date}.")
         return
 
-    insert_sql = """
-        INSERT INTO monthly_factors (ticker, factor_date, factor_name, factor_value)
-        VALUES %s
-        ON CONFLICT (ticker, factor_date, factor_name) DO UPDATE
-        SET factor_value = EXCLUDED.factor_value
-    """
+    print(f"Bulk copying {len(results)} growth factor records for {factor_date}...")
+
+    # prepare CSV in memory
+    csv_buffer = io.StringIO()
+    writer = csv.writer(csv_buffer)
+    writer.writerows(results)
+    csv_buffer.seek(0)
 
     with conn.cursor() as cur:
-        psycopg2.extras.execute_values(cur, insert_sql, results)
+
+        # Create temporary table for bulk insert
+        cur.execute("""
+            CREATE TEMP TABLE tmp_growth_factors (
+                ticker TEXT,
+                factor_date DATE,
+                factor_name TEXT,
+                factor_value FLOAT8
+            ) ON COMMIT DROP
+        """)
         conn.commit()
 
-    print(f"Inserted/updated {len(results)} growth factor records across months.")
+        # Bulk copy from CSV buffer into temp table
+        cur.copy_expert("COPY tmp_growth_factors FROM STDIN WITH CSV", csv_buffer)
+        conn.commit()
+
+        # Upsert from temp table into main table
+        upsert_sql = """
+            INSERT INTO monthly_factors (ticker, factor_date, factor_name, factor_value)
+            SELECT ticker, factor_date, factor_name, factor_value FROM tmp_growth_factors
+            ON CONFLICT (ticker, factor_date, factor_name) DO UPDATE
+            SET factor_value = EXCLUDED.factor_value
+        """
+        cur.execute(upsert_sql)
+        conn.commit()
+
+    print(f"Successfully bulk upserted {len(results)} growth factor records for {factor_date}.")
+
+
+def compute_and_upsert_growth_factors_single_batch(conn_params, engine_params, max_lookback_months, batch_dates):
+    batch_start = batch_dates[0]
+    batch_end = batch_dates[-1]
+    engine = create_engine(
+        f"postgresql+psycopg2://{engine_params['user']}:{engine_params['password']}@"
+        f"{engine_params['host']}:{engine_params['port']}/{engine_params['dbname']}"
+    )
+    conn = psycopg2.connect(**conn_params)
+    print(f"Processing growth factors for batch {batch_start} to {batch_end}...")
+    extended_start = batch_start - relativedelta(months=max_lookback_months)
+
+    factors_to_grow = ['ttm_sales', 'ttm_fcf', 'ttm_net_income',
+                      'ttm_eps', 'ttm_div', 'shares_diluted']
+
+    sql_fetch = """
+        SELECT ticker, factor_date, factor_name, factor_value
+        FROM monthly_factors
+        WHERE factor_name = ANY(%s)
+          AND factor_date BETWEEN %s AND %s
+        ORDER BY ticker, factor_name, factor_date
+    """
+    df_raw = pd.read_sql(sql_fetch, con=engine,
+                         params=(factors_to_grow, extended_start, batch_end))
+    df_raw['factor_date'] = pd.to_datetime(df_raw['factor_date'])
+
+    if df_raw.empty:
+        print(f"No data between {extended_start} and {batch_end}")
+        conn.close()
+        return 0
+
+    def resample_forward_fill(group):
+        if isinstance(group.name, tuple):
+            ticker, factor_name = group.name
+        else:
+            ticker = group.name
+            factor_name = None
+        group = group.set_index('factor_date').resample('ME').ffill()
+        group['ticker'] = ticker
+        if factor_name is not None:
+            group['factor_name'] = factor_name
+        return group.reset_index()
+
+    df_monthly = (df_raw.groupby(['ticker', 'factor_name'], group_keys=False)
+                  .apply(resample_forward_fill, include_groups=False)
+                  .reset_index(drop=True))
+
+    lookbacks = [12, 60]
+    results = []
+    print(f"Calculating growth factors...")
+    for factor in factors_to_grow:
+        df_factor = df_monthly[df_monthly['factor_name'] == factor].copy()
+        df_factor.sort_values(['ticker', 'factor_date'], inplace=True)
+
+        for lb in lookbacks:
+            lag_col = f'lag_{lb}'
+            df_factor[lag_col] = df_factor.groupby('ticker')['factor_value'].shift(lb)
+
+            valid_mask = (df_factor[lag_col].notna() &
+                          df_factor['factor_value'].notna() &
+                          (df_factor[lag_col] != 0))
+            df_valid = df_factor[valid_mask].copy()
+
+            growth_vals = ((df_valid['factor_value'] - df_valid[lag_col]) /
+                           df_valid[lag_col])
+            growth_vals = growth_vals.replace([float('inf'), float('-inf')], pd.NA).dropna()
+            df_valid = df_valid.loc[growth_vals.index]
+
+            if growth_vals.empty:
+                continue
+
+            factor_records = list(zip(
+                df_valid['ticker'],
+                df_valid['factor_date'].dt.strftime('%Y-%m-%d'),
+                [f"{factor}_growth_{lb}m"] * len(growth_vals),
+                growth_vals,
+            ))
+            results.extend(factor_records)
+    print(f"Preparing to upsert {len(results)} growth factor records for batch {batch_start} to {batch_end}...")
+    if results:
+        csv_buffer = io.StringIO()
+        writer = csv.writer(csv_buffer)
+        writer.writerows(results)
+        csv_buffer.seek(0)
+
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TEMP TABLE tmp_growth_factors (
+                    ticker TEXT,
+                    factor_date DATE,
+                    factor_name TEXT,
+                    factor_value FLOAT8
+                ) ON COMMIT DROP
+            """)
+
+            cur.copy_expert("COPY tmp_growth_factors FROM STDIN WITH CSV", csv_buffer)
+
+            upsert_sql = """
+                INSERT INTO monthly_factors (ticker, factor_date, factor_name, factor_value)
+                SELECT ticker, factor_date, factor_name, factor_value FROM tmp_growth_factors
+                ON CONFLICT (ticker, factor_date, factor_name) DO UPDATE
+                SET factor_value = EXCLUDED.factor_value
+            """
+            cur.execute(upsert_sql)
+
+        conn.commit()
+        print(f"Batch {batch_start} to {batch_end} upserted {len(results)} records.")
+    else:
+        print(f"Batch {batch_start} to {batch_end} no growth factors to upsert.")
+
+    conn.close()
+    return len(results)
+
+
+def compute_and_upsert_growth_factors_batch_vectorized(
+        conn_params, engine_params, factor_dates, batch_period_months=24,
+        max_lookback_months=84, max_workers=2):
+    batches = [factor_dates[i:i + batch_period_months] for i in range(0, len(factor_dates), batch_period_months)]
+    print(f"Processing growth factors in {len(batches)} batches with up to {max_workers} workers...")
+    worker = partial(compute_and_upsert_growth_factors_single_batch,
+                     conn_params, engine_params, max_lookback_months)
+
+    with mp.Pool(max_workers) as pool:
+        results = pool.map(worker, batches)
+
+    print(f"Total upserted records: {sum(results)}")
 
 
 def count_valid_factors_per_date(conn, factor_date):
@@ -841,88 +1014,82 @@ def count_valid_factors_per_date(conn, factor_date):
             ORDER BY valid_count DESC
         """, (factor_date,))
         rows = cur.fetchall()
-        print(f"Valid data points count for factors on {factor_date}:")
-        for factor_name, count in rows:
-            print(f"  {factor_name}: {count}")
+        if not rows:
+            print(f"No valid factors found for date {factor_date}")
+        else:
+            print(f"Valid data points count for factors on {factor_date}:")
+            for factor_name, count in rows:
+                print(f"  {factor_name}: {count}")
     return rows
 
 
-def process_indicator_for_date(conn_params, factor_date, indicator):
-    conn = get_conn_from_pool()
-    try:
-        build_factor_generic(conn, factor_date, indicator)
-        print(f"Built factor {indicator['factor_name']} for date {factor_date}")
-        conn.commit()
-    finally:
-        put_conn_back(conn)
+def get_date_chunks(start, end, chunk_size_months):
+    current_start = start
+    while current_start <= end:
+        current_end = min(current_start + relativedelta(months=chunk_size_months) - timedelta(days=1), end)
+        yield current_start, current_end
+        current_start = current_end + timedelta(days=1)
 
-            
-def run_full_rebuild(conn_params, engine, indicators):
+
+def run_full_rebuild(conn_params, engine_params, indicators, batch_period_months=24, max_lookback_months=84):
     init_connection_pool(conn_params)
-
-    start_date = date(2000, 1, 1)
+    start_date = date(2016, 1, 1)
     today = datetime.today()
     end_date = (today.replace(day=1) - timedelta(days=1)).date()
-    dates = get_monthly_eom_dates(start_date, end_date)
-    print(f"Running full rebuild from {start_date} to {end_date}, total months: {len(dates)}")
 
-    with concurrent.futures.ProcessPoolExecutor(max_workers=4) as executor:
-        for i, factor_date in enumerate(dates, start=1):
-            print(f"[{i}/{len(dates)}] Processing fundamental factors for {factor_date}")
-            tasks = [(conn_params, factor_date, indicator) for indicator in indicators]
-            executor.map(lambda args: process_indicator_for_date(*args), tasks, chunksize=5)
+    all_chunks = list(get_date_chunks(start_date, end_date, batch_period_months))
+    all_factor_dates = []
 
-            with psycopg2.connect(**conn_params) as conn:
-                print(f"  Computing and upserting extended factors for {factor_date}")
-                compute_and_upsert_extended_factors(conn, factor_date, engine, indicators)
-                conn.commit()
-            # print(f"Finished processing {factor_date}")
+    # Step 1: Compute extended factors for all batches sequentially
+    for chunk_start, chunk_end in tqdm(all_chunks, desc="Extended factor rebuild batches"):
+        extended_start = max(pd.Timestamp('2000-01-01'), pd.Timestamp(chunk_start) - relativedelta(months=max_lookback_months))
+        factor_dates = get_monthly_eom_dates(chunk_start, chunk_end)
+        all_factor_dates.extend(factor_dates)
 
-    # Compute growth factors once for all months after rebuilding extended factors
-    with psycopg2.connect(**conn_params) as conn:
-        print("Computing growth factors for all months...")
-        compute_and_upsert_growth_factors(conn, engine)
-        print("Growth factors computation complete.")
+        compute_and_upsert_extended_factors_batch(conn_params, engine_params, indicators, factor_dates, extended_start)
 
-    with psycopg2.connect(**conn_params) as conn:
-        for factor_date in dates:
-            print(f"Counting valid factor values for {factor_date}")
-            count_valid_factors_per_date(conn, factor_date)
+    # Step 2: Compute growth factors vectorized after all extended factors are done
+    compute_and_upsert_growth_factors_batch_vectorized(conn_params, engine_params, all_factor_dates, batch_period_months, max_lookback_months)
 
-    print("Full rebuild complete.")
+    close_connection_pool()
 
-
-def run_incremental_update(conn_params, engine, since_date):
+def run_incremental_update(conn_params, engine_params, indicators, since_date, batch_period_months=24, max_lookback_months=84):
     init_connection_pool(conn_params)
-
     today = datetime.today()
     last_month_end = (today.replace(day=1) - timedelta(days=1)).date()
-    dates = get_monthly_eom_dates(since_date, last_month_end)
-    print(f"Running incremental rebuild from {since_date} to {last_month_end}")
+    all_chunks = list(get_date_chunks(since_date, last_month_end, batch_period_months))
+    all_factor_dates = []
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        for factor_date in dates:
-            print(f"Processing fundamental factors for {factor_date}")
-            tasks = [(conn_params, factor_date, indicator) for indicator in indicators]
-            executor.map(lambda args: process_indicator_for_date(*args), tasks)
+    # Step 1: Compute extended factors for all incremental batches sequentially
+    for chunk_start, chunk_end in tqdm(all_chunks, desc="Extended factor incremental batches"):
+        # Adjust extended_start to be relative to chunk_start rather than fixed 2018 date
+        extended_start = max(pd.Timestamp(chunk_start) - relativedelta(months=max_lookback_months), pd.Timestamp(chunk_start))
+        factor_dates = get_monthly_eom_dates(chunk_start, chunk_end)
+        all_factor_dates.extend(factor_dates)
 
-            with psycopg2.connect(**conn_params) as conn:
-                compute_and_upsert_extended_factors(conn, factor_date, engine, indicators)
-                # Growth factors now compute for all months internally
-                compute_and_upsert_growth_factors(conn, engine)
-                count_valid_factors_per_date(conn, factor_date)
-                conn.commit()
+        compute_and_upsert_extended_factors_batch(conn_params, engine_params, indicators, factor_dates, extended_start)
+
+    # Step 2: Compute growth factors vectorized after all extended factors are done
+    # Reduce batch_period_months to 6 months for growth factor computation batches
+    compute_and_upsert_growth_factors_batch_vectorized(
+        conn_params, engine_params, all_factor_dates,
+        batch_period_months=6,  # smaller chunks to improve processing efficiency
+        max_lookback_months=max_lookback_months
+    )
+
+    close_connection_pool()
 
 
-def rebuild_specific_factors(conn_params, engine, target_factors, start_date=None, end_date=None):
+def rebuild_specific_factors(conn_params, engine_params, target_factors, start_date=None, end_date=None,
+                            batch_period_months=24, max_lookback_months=84):
     init_connection_pool(conn_params)
 
     if start_date is None:
-        start_date = date(2000,1,1)
+        start_date = date(2000, 1, 1)
     if end_date is None:
         today = datetime.today()
         end_date = (today.replace(day=1) - timedelta(days=1)).date()
-    dates = get_monthly_eom_dates(start_date, end_date)
+
     print(f"Running rebuild for specified factors {target_factors} from {start_date} to {end_date}")
 
     dependency_map = {
@@ -931,7 +1098,7 @@ def rebuild_specific_factors(conn_params, engine, target_factors, start_date=Non
         'debt_to_equity': ['long_term_debt', 'short_term_debt', 'cash_and_equiv', 'total_equity_last'],
         'ttm_eps': ['ttm_net_income', 'shares_diluted'],
         'enterprise_value': ['market_cap', 'long_term_debt', 'short_term_debt', 'cash_and_equiv'],
-        'yrs_to_cash': ['ttm_cash_flows', 'ttm_capex', 'ttm_fcf', 'cash_and_equiv','long_term_debt', 'short_term_debt', 'cash_and_equiv'],
+        'yrs_to_cash': ['ttm_cash_flows', 'ttm_capex', 'ttm_fcf', 'cash_and_equiv', 'long_term_debt', 'short_term_debt', 'cash_and_equiv'],
         'post_tax': ['ttm_tax', 'ttm_pbt'],
         'working_capital': ['curr_assets', 'curr_liab'],
         'invested_capital_nf': ['working_capital', 'cash_and_equiv', 'net_fixed_assets'],
@@ -940,7 +1107,7 @@ def rebuild_specific_factors(conn_params, engine, target_factors, start_date=Non
         'roic': ['ttm_ebit', 'post_tax', 'invested_capital'],
         'np_margin': ['ttm_net_income', 'ttm_sales'],
         'ebit_yield': ['ttm_ebit', 'enterprise_value'],
-        'pe': ['ttm_net_income', 'market_cap']
+        'pe': ['ttm_net_income', 'market_cap'],
     }
 
     needed_raw_factors = set()
@@ -953,28 +1120,41 @@ def rebuild_specific_factors(conn_params, engine, target_factors, start_date=Non
         'working_capital', 'ttm_eps', 'post_tax', 'ttm_fcf', 'invested_capital',
         'enterprise_value', 'ebit_yield', 'pe', 'pb', 'roe', 'roa', 'div_yield',
         'div_cover', 'debt_to_equity', 'roic', 'fcf_yield', 'gp_margin',
-        'np_margin', 'yrs_to_cash'
+        'np_margin', 'yrs_to_cash',
     }
+
     growth_factors = ['ttm_sales', 'ttm_fcf', 'ttm_net_income', 'ttm_eps', 'ttm_div', 'shares_diluted']
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        for factor_date in dates:
-            print(f"Rebuilding specified factors for {factor_date}...")
+    all_chunks = list(get_date_chunks(start_date, end_date, batch_period_months))
+    all_factor_dates = []
 
-            tasks = [(conn_params, factor_date, indicator) for indicator in indicators_to_build]
-            executor.map(lambda args: process_indicator_for_date(*args), tasks)
+    if any(f in extended_factors for f in target_factors):
+        # Step 1: Compute extended factors in batches sequentially
+        for chunk_start, chunk_end in tqdm(all_chunks, desc="Extended factor rebuild batches"):
+            extended_start = max(pd.Timestamp('2000-01-01'), pd.Timestamp(chunk_start) - relativedelta(months=max_lookback_months))
+            factor_dates = get_monthly_eom_dates(chunk_start, chunk_end)
+            all_factor_dates.extend(factor_dates)
 
-            if any(f in extended_factors for f in target_factors):
-                with psycopg2.connect(**conn_params) as conn:
-                    compute_and_upsert_extended_factors(conn, factor_date, engine, indicators_to_build)
+            compute_and_upsert_extended_factors_batch(conn_params, engine_params, indicators_to_build, factor_dates, extended_start)
+    else:
+        # Just accumulate factor_dates if no extended factors requested
+        for chunk_start, chunk_end in all_chunks:
+            factor_dates = get_monthly_eom_dates(chunk_start, chunk_end)
+            all_factor_dates.extend(factor_dates)
 
-            if any(f in growth_factors for f in target_factors):
-                with psycopg2.connect(**conn_params) as conn:
-                    compute_and_upsert_growth_factors(conn, engine)
+    # Step 2: Compute growth factors vectorized once over entire relevant date range
+    if any(f in growth_factors for f in target_factors):
+        compute_and_upsert_growth_factors_batch_vectorized(
+            conn_params, engine_params, all_factor_dates, batch_period_months, max_lookback_months
+        )
 
-            with psycopg2.connect(**conn_params) as conn:
-                count_valid_factors_per_date(conn, factor_date)
-                conn.commit()
+    # Step 3: Count valid factors per date for logging/debug
+    with psycopg2.connect(**conn_params) as conn:
+        for factor_date in all_factor_dates:
+            count_valid_factors_per_date(conn, factor_date)
+        conn.commit()
+
+    close_connection_pool()
 
 
 if __name__ == "__main__":
@@ -983,8 +1163,6 @@ if __name__ == "__main__":
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     params = config['database']
-    conn_str = f"postgresql+psycopg2://{params['user']}:{params['password']}@{params['host']}:{params['port']}/{params['dbname']}"
-    engine = create_engine(conn_str)
 
     conn_params = dict(
         dbname=params['dbname'],
@@ -994,23 +1172,28 @@ if __name__ == "__main__":
         port=params['port']
     )
 
+    engine_params = {
+        'dbname': params['dbname'],
+        'user': params['user'],
+        'password': params['password'],
+        'host': params['host'],
+        'port': params['port']
+    }
+
     try:
-        target_factors = []
-        if target_factors:
-            print(f"Rebuilding specific factors:  {target_factors}")
-            rebuild_specific_factors(conn_params, engine, target_factors)
+        mode = decide_mode()
+        # mode = 'full'
+        if mode == 'full':
+            run_full_rebuild(conn_params, engine_params, indicators)
+        elif mode == 'incremental':
+            since_date = datetime.today().date() - relativedelta(months=24)
+            run_incremental_update(
+                conn_params, engine_params, indicators, since_date,
+                batch_period_months=6,  # smaller update chunk size
+                max_lookback_months=84  # keep large history window
+            )
         else:
-            mode = decide_mode()
-            # mode = 'full'
-            if mode == 'full':
-                run_full_rebuild(conn_params, engine, indicators)
-            elif mode == 'incremental':
-                since_date = datetime.today().date() - timedelta(days=180)
-                run_incremental_update(conn_params, engine, since_date)
-            else:
-                print("Not scheduled to run today")
+            print("Not scheduled to run today")
     finally:
-        
         close_connection_pool()
         print("DB connection pool closed.")
-
