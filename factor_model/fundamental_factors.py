@@ -991,7 +991,7 @@ def compute_and_upsert_growth_factors_single_batch(conn_params, engine_params, m
 
 
 def compute_and_upsert_growth_factors_batch_vectorized(
-        conn_params, engine_params, factor_dates, batch_period_months=24,
+        conn_params, engine_params, factor_dates, batch_period_months=4,
         max_lookback_months=84, max_workers=2):
     batches = [factor_dates[i:i + batch_period_months] for i in range(0, len(factor_dates), batch_period_months)]
     print(f"Processing growth factors in {len(batches)} batches with up to {max_workers} workers...")
@@ -1033,7 +1033,7 @@ def get_date_chunks(start, end, chunk_size_months):
 
 def run_full_rebuild(conn_params, engine_params, indicators, batch_period_months=24, max_lookback_months=84):
     init_connection_pool(conn_params)
-    start_date = date(2016, 1, 1)
+    start_date = date(2000, 1, 1)
     today = datetime.today()
     end_date = (today.replace(day=1) - timedelta(days=1)).date()
 
@@ -1073,7 +1073,7 @@ def run_incremental_update(conn_params, engine_params, indicators, since_date, b
     # Reduce batch_period_months to 6 months for growth factor computation batches
     compute_and_upsert_growth_factors_batch_vectorized(
         conn_params, engine_params, all_factor_dates,
-        batch_period_months=6,  # smaller chunks to improve processing efficiency
+        batch_period_months=2,  # smaller chunks to improve processing efficiency
         max_lookback_months=max_lookback_months
     )
 
@@ -1189,7 +1189,7 @@ if __name__ == "__main__":
             since_date = datetime.today().date() - relativedelta(months=24)
             run_incremental_update(
                 conn_params, engine_params, indicators, since_date,
-                batch_period_months=6,  # smaller update chunk size
+                batch_period_months=2,  # smaller update chunk size
                 max_lookback_months=84  # keep large history window
             )
         else:

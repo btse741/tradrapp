@@ -1,7 +1,9 @@
 import pandas as pd
 import numpy as np
 import yaml
+import os
 import logging
+import matplotlib.pyplot as plt
 from sqlalchemy import create_engine, text
 from sqlalchemy.pool import NullPool
 from datetime import date, timedelta
@@ -9,9 +11,7 @@ from dateutil.relativedelta import relativedelta
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
+logging.basicConfig(level=logging.INFO, format='%(message)s')  # removes timestamps and info prefixes from logs
 
 def decide_mode(today=None):
     if today is None:
@@ -100,7 +100,6 @@ def fetch_and_compute_returns(engine, tickers, start_date, end_date):
     return df
 
 
-
 def backtest_for_single_factor_date(conn_str, factor_date, quantiles=5):
     engine = create_engine(conn_str, poolclass=NullPool)
 
@@ -163,11 +162,6 @@ def backtest_for_single_factor_date(conn_str, factor_date, quantiles=5):
             bottom_return = merged.loc[merged['quantile'] == 1, 'cum_return'].mean()
             long_short_return = top_return - bottom_return
 
-            log_msg = (f"Period returns for {factor_name} at {factor_date} holding {hold_start} to {hold_end}: "
-                       f"Top: {top_return:.4f}, Bottom: {bottom_return:.4f}, Long-Short: {long_short_return:.4f}")
-            logging.info(log_msg)
-            print(log_msg)
-
             results.append({
                 'factor_date': factor_date,
                 'factor_name': factor_name,
@@ -179,6 +173,17 @@ def backtest_for_single_factor_date(conn_str, factor_date, quantiles=5):
             })
 
         results_df = pd.DataFrame(results)
+        if not results_df.empty:
+            # Persist this factor_date’s results immediately
+            csv_path = 'backtest_results_progress.csv'
+            file_exists = os.path.isfile(csv_path)
+            results_df.to_csv(
+                csv_path,
+                mode='a',
+                index=False,
+                header=not file_exists  # write header only once
+            )
+
         print(f"Summary returns for factor_date {factor_date}:")
         print(results_df)
         return results
@@ -205,13 +210,17 @@ def backtest_all_factors_monthly_parallel(conn_str, start_date, end_date, max_wo
 
     results_df = pd.DataFrame(results_all)
     if not results_df.empty:
-        results_df['cum_long_short_return'] = results_df.groupby('factor_name')['long_short_return']\
-            .apply(lambda x: (1 + x.fillna(0)).cumprod() - 1)
+        results_df = results_df.sort_values(['factor_name', 'factor_date'])
+        results_df['cum_long_short_return'] = (
+            results_df
+            .groupby('factor_name')['long_short_return']
+            .transform(lambda x: (1 + x.fillna(0)).cumprod() - 1)
+        )
+    logging.info(f"Completed backtesting from {start_date} to {end_date}")
     return results_df
 
 
 def plot_factor_performance(results_df):
-    import matplotlib.pyplot as plt
     plt.figure(figsize=(14, 7))
     for factor_name, group in results_df.groupby('factor_name'):
         plt.plot(group['factor_date'], group['cum_long_short_return'], label=factor_name)
@@ -225,6 +234,7 @@ def plot_factor_performance(results_df):
 
 
 if __name__ == '__main__':
+    logging.info("Starting factor backtest script")
     with open('config.yml') as f:
         config = yaml.safe_load(f)
     db = config['database']
@@ -235,7 +245,7 @@ if __name__ == '__main__':
     mode = 'full'
     today = date.today()
     if mode == 'full':
-        start_dt = date(2010, 1, 1)
+        start_dt = date(2005, 1, 1)
         end_dt = today - timedelta(days=1)
         logging.info("Starting full backtest mode")
     elif mode == 'incremental':

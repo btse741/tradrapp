@@ -1,71 +1,61 @@
 # Stage 1: Builder - build dependencies and wheels
-FROM nvidia/cuda:11.8.0-devel-ubuntu20.04 AS builder
+FROM nvidia/cuda:11.8.0-devel-ubuntu22.04 AS builder
 
 WORKDIR /app
 
-# Prevent interactive prompts during package installs
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Etc/UTC
-
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
-# Environment variables for cleaner Python behavior
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
-
-# Install system dependencies, build tools, python, R, and libraries
+# Install system build dependencies including Python 3.10, distutils, and R dev libs
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc build-essential libpq-dev python3 python3-pip python3-dev \
+    gcc build-essential libpq-dev python3.10 python3.10-venv python3-pip python3.10-distutils \
     r-base r-base-dev libcurl4-openssl-dev libssl-dev libxml2-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements and build wheels (with pip cache for speed)
+# Upgrade pip, setuptools, wheel, and build tools before building wheels
+RUN python3.10 -m pip install --upgrade pip setuptools wheel build
+
+# Set python3 alternative to python3.10
+RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1
+
 COPY requirements.txt .
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip3 wheel --no-cache-dir --no-deps --wheel-dir /wheels -r requirements.txt
-
-# Optional: build wheels for specific heavy packages like numba and llvmlite
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip3 wheel --no-cache-dir --no-deps --wheel-dir /wheels numba llvmlite
+    python3.10 -m pip wheel --no-cache-dir --no-deps --wheel-dir /wheels -r requirements.txt
 
 # Stage 2: Runtime - slim image
-FROM nvidia/cuda:11.8.0-runtime-ubuntu20.04
+FROM nvidia/cuda:11.8.0-runtime-ubuntu22.04
 
 WORKDIR /app
 
-# Prevent interactive prompts during package installs
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Etc/UTC
-
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
-# Install Python3, pip3, runtime dependencies, and R packages
+# Install runtime dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-pip r-base r-base-dev libcurl4-openssl-dev libssl-dev libxml2-dev libpq-dev \
-    && rm -rf /var/lib/apt/lists/*
+    python3.10 python3.10-venv python3-pip \
+    r-base r-base-dev libcurl4-openssl-dev libssl-dev libxml2-dev libpq-dev \
+    && rm -rf /var/lib/apt/lists/* && \
+    mkdir -p /app/data /app/output
 
-# Copy wheels and requirements
+RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1
+RUN python3.10 -m pip install --upgrade pip
+
+RUN R -e "install.packages(c('DBI','RPostgres','dplyr'), repos='https://cloud.r-project.org')"
+
 COPY --from=builder /wheels /wheels
 COPY requirements.txt .
 
-# Install all dependencies from pre-built wheels (with pip cache)
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip3 install --no-cache-dir /wheels/*
+    python3.10 -m pip install --no-cache-dir /wheels/*
 
-# Install Playwright and its dependencies
-RUN pip3 install playwright && python3 -m playwright install chromium
+RUN python3.10 -m pip install playwright && python3.10 -m playwright install chromium
 
-# Copy your app code
 COPY . /app
 
-# Create necessary directories
-RUN mkdir -p /app/data /app/output
-
-# Make your script executable
 RUN chmod +x /app/run_all.sh
 
-# Set CUDA library path environment variable
 ENV LD_LIBRARY_PATH=/usr/local/cuda-11.8/lib64:${LD_LIBRARY_PATH}
 
-# Default command to run your script
 CMD ["/app/run_all.sh"]

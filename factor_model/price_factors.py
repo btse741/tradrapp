@@ -3,6 +3,7 @@ import yaml
 import psycopg2
 import pandas as pd
 import numpy as np
+import time 
 import io
 import gc
 import multiprocessing as mp
@@ -201,7 +202,13 @@ def compute_monthly_factors(df_daily):
 
     last_adj_close = df_daily.groupby(['ticker', 'month_end']).last().reset_index()[['ticker', 'month_end', 'adj_close']]
     last_adj_close.rename(columns={'month_end': 'factor_date'}, inplace=True)
+
+    last_market_cap = df_daily.groupby(['ticker', 'month_end']).last().reset_index()[['ticker', 'month_end', 'market_cap']]
+    last_market_cap.rename(columns={'month_end': 'factor_date'}, inplace=True)
+
     monthly_avg = monthly_avg.merge(last_adj_close, on=['ticker', 'factor_date'], how='left')
+    monthly_avg = monthly_avg.merge(last_market_cap, on=['ticker', 'factor_date'], how='left')  
+    gc.collect()
 
     monthly_avg['mom_12m'] = safe_momentum_calc(monthly_avg['adj_close'], 1, 12)
     monthly_avg['mom_6m'] = safe_momentum_calc(monthly_avg['adj_close'], 1, 7)
@@ -293,12 +300,22 @@ def process_factor_df_in_chunks(conn, df, factor_names, date_col='date',
         gc.collect()
 
 def worker_upsert(df_chunk, factor_names, date_col, target_table, conflict_cols, update_cols, db_params, factor_group_name):
-    conn = psycopg2.connect(**db_params)
-    try:
-        process_factor_df_in_chunks(conn, df_chunk, factor_names, date_col, target_table,
-                                   conflict_cols, update_cols, db_params, factor_group_name)
-    finally:
-        conn.close()
+    max_retries = 3
+    attempt = 0
+    while attempt < max_retries:
+        try:
+            conn = psycopg2.connect(**db_params)
+            try:
+                process_factor_df_in_chunks(conn, df_chunk, factor_names, date_col, target_table,
+                                           conflict_cols, update_cols, db_params, factor_group_name)
+            finally:
+                conn.close()
+            break  # success, exit retry loop
+        except psycopg2.InterfaceError as e:
+            attempt += 1
+            if attempt >= max_retries:
+                raise
+            time.sleep(5)  # wait before retrying
 
 def parallel_process_factor_df_in_chunks(df, factor_names, date_col='date',
                                         target_table='daily_factors',
@@ -318,6 +335,8 @@ def parallel_process_factor_df_in_chunks(df, factor_names, date_col='date',
 
     with mp.Pool(n_jobs) as pool:
         list(tqdm(pool.starmap(worker_upsert, args), total=len(args), desc=f'Parallel upsert {factor_group_name}'))
+    
+    gc.collect
 
 # The monthly equivalents can be similarly updated, here is the monthly factor chunk processing:
 
@@ -424,7 +443,7 @@ def date_chunks(start_date, end_date, chunk_size_months=1):
         yield current_start, current_end
         current_start = current_end + timedelta(days=1)
 
-MAX_DAILY_LOOKBACK_MONTHS = 120  # extended to 6 years for monthly factor lookbacks
+MAX_DAILY_LOOKBACK_MONTHS = 84  # extended to 6 years for monthly factor lookbacks
 MAX_MONTHLY_LOOKBACK_MONTHS = 84
 
 daily_factors = [
@@ -435,10 +454,11 @@ daily_factors = [
 ]
 
 monthly_factors = [
-    'avg_daily_turnover', 'avg_illiquidity', 'adj_close', 'mom_12m', 'mom_6m', 'mom_3m',
+    'adj_close', 'market_cap', 
+    'avg_daily_turnover', 'avg_illiquidity', 
+    'mom_12m', 'mom_6m', 'mom_3m', 
     'pct_change_1m', 'pct_change_3m', 'pct_change_6m', 'pct_change_12m', 'pct_change_24m', 'pct_change_60m'
 ]
-
 
 def ensure_timestamp(dt):
     if not isinstance(dt, pd.Timestamp):
@@ -461,8 +481,10 @@ def run_full_update(conn, engine, start_date, end_date, db_params):
 
         df_daily = load_daily_prices(engine, extended_daily_start, chunk_end)
         df_indicators_full = compute_indicators(df_daily)
+        gc.collect()
 
         df_indicators = df_indicators_full[df_indicators_full['date'] >= chunk_start]
+        gc.collect()
 
         print("Starting daily factors upsert...")
         parallel_process_factor_df_in_chunks(
@@ -503,8 +525,10 @@ def run_incremental_update(conn, engine, start_date, end_date, db_params):
 
     df_daily = load_daily_prices(engine, extended_daily_start, batch_end)
     df_indicators_full = compute_indicators(df_daily)
+    gc.collect()
 
     df_indicators = df_indicators_full[df_indicators_full['date'] >= batch_start]
+    gc.collect()
 
     print("Starting incremental daily factors upsert...")
     parallel_process_factor_df_in_chunks(
@@ -547,8 +571,10 @@ def run_daily_incremental_update(conn, engine, db_params):
 
     df_daily = load_daily_prices(engine, extended_daily_start, update_day)
     df_indicators_full = compute_indicators(df_daily)
+    gc.collect()   
 
     df_indicators = df_indicators_full[df_indicators_full['date'] >= batch_start]
+    gc.collect()
 
     print("Starting daily incremental factors upsert...")
     parallel_process_factor_df_in_chunks(
@@ -562,7 +588,7 @@ def run_daily_incremental_update(conn, engine, db_params):
 
 if __name__ == "__main__":
     today = datetime.today().date()
-    start = date(2000, 1, 1)
+    start = date(2020, 1, 1)
     end = today
 
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -597,4 +623,5 @@ if __name__ == "__main__":
         run_daily_incremental_update(conn, engine, db_connect_params)
     finally:
         conn.close()
+        gc.collect()
         print("DB connection closed.")

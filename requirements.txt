@@ -1,12 +1,10 @@
 aiohappyeyeballs
 aiohttp
 aiosignal
-altair
 anyio
 appdirs
 attrs
 beautifulsoup4
-bleach
 blinker
 bs4
 cachetools
@@ -15,7 +13,7 @@ cffi
 charset-normalizer
 click
 colorama
-contourpy
+contourpy>=1.3.2
 cssselect
 cssutils
 curl_cffi
@@ -65,7 +63,7 @@ nbclient
 nbconvert
 nbformat
 nest-asyncio
-numpy
+numpy>=1.24,<2.0
 numba
 llvmlite
 openpyxl
@@ -81,9 +79,7 @@ playwright
 plotly
 propcache
 protobuf
-psycopg2
 psycopg2-binary
-pyarrow
 pycparser
 pydeck
 pyee
@@ -100,9 +96,6 @@ referencing
 requests
 requests-html
 rpds-py
-rpy2
-rpy2-rinterface
-rpy2-robjects
 scipy
 seaborn
 sgmllib3k
@@ -111,13 +104,12 @@ six
 smmap
 sniffio
 soupsieve
-SQLAlchemy
+sqlalchemy
 streamlit
 streamlit-autorefresh
 streamlit-calendar
 ta
 tenacity
-tinycss2
 toml
 toolz
 tornado

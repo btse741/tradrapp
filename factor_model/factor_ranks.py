@@ -12,7 +12,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 import logging
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(message)s')  # removes timestamps and info prefixes from logs
 
 def decide_mode(today=None):
     if today is None:
@@ -38,7 +38,6 @@ def decide_mode(today=None):
         return "full"
     return "incremental"
 
-
 def get_monthly_eom_dates(start, end):
     dates = []
     current = start.replace(day=1)
@@ -49,7 +48,6 @@ def get_monthly_eom_dates(start, end):
         current = next_month
     return dates
 
-
 def adaptive_winsorize_series(s):
     q1 = s.quantile(0.25)
     q3 = s.quantile(0.75)
@@ -59,16 +57,11 @@ def adaptive_winsorize_series(s):
     winsorized = s.clip(lower, upper)
     return winsorized
 
-
 def standardize_series(s):
-    # Using sample std deviation ddof=1 for unbiased estimator
     return (s - s.mean()) / s.std(ddof=1)
 
-
 def impute_missing(df):
-    # Simple median imputation
     return df.fillna(df.median())
-
 
 def preprocess_factors(df, factor_cols):
     processed = pd.DataFrame(index=df.index)
@@ -80,7 +73,6 @@ def preprocess_factors(df, factor_cols):
                 continue
             wins = adaptive_winsorize_series(clean_series)
             std = standardize_series(wins)
-            # Map standardized values back to original index to preserve alignment
             std_full = pd.Series(np.nan, index=df.index)
             std_full.loc[std.index] = std
             processed[col] = std_full
@@ -89,19 +81,33 @@ def preprocess_factors(df, factor_cols):
     processed = impute_missing(processed)
     return processed
 
-
 def rank_series(s, ascending=True):
     return s.rank(method='average', ascending=ascending)
-
 
 def weighted_composite_score(df, weights):
     present_cols = [col for col in weights.keys() if col in df.columns]
     weighted_sum = sum(df[col] * weights[col] for col in present_cols)
     return weighted_sum
 
+def count_valid_factors_per_date(conn, factor_date):
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT factor_name, COUNT(factor_value) AS valid_count
+            FROM monthly_factors
+            WHERE factor_date = %s AND factor_value IS NOT NULL
+            GROUP BY factor_name
+            ORDER BY valid_count DESC
+        """, (factor_date,))
+        rows = cur.fetchall()
+        if not rows:
+            print(f"No valid factors found for date {factor_date}")
+        else:
+            print(f"Valid data points count for factors on {factor_date}:")
+            for factor_name, count in rows:
+                print(f"  {factor_name}: {count}")
+    return rows
 
 def generate_scores_only(conn, engine, factor_date, min_unique=5):
-    # List all factors used in composites:
     all_factors = [
         'roic', 'ebit_yield', 'pe', 'pb',
         'ttm_sales_growth_60m', 'ttm_net_income_growth_60m', 'ttm_fcf_growth_60m',
@@ -121,8 +127,6 @@ def generate_scores_only(conn, engine, factor_date, min_unique=5):
 
     processed = preprocess_factors(df_pivot, all_factors)
 
-    # Composite Scores Definitions with weighted sum
-    # Weights from your original, possibly dynamic in future
     composite_weights = {
         'composite_growth_score': {
             'ttm_sales_growth_60m': 0.33,
@@ -152,46 +156,55 @@ def generate_scores_only(conn, engine, factor_date, min_unique=5):
         }
     }
 
+    # Factors that require inverted direction (ascending ranking)
+    invert_factor_signs = {
+        'shares_diluted_growth_60m',
+        'pe',
+        'pb',
+        'pct_change_60m'
+    }
+
     scores = {}
 
-    # Magic Formula (roic + ebit_yield)
+    # Magic Formula (roic + ebit_yield) both descending (higher better)
     mf_cols = ['roic', 'ebit_yield']
     mf_valid = processed[mf_cols].dropna()
     mf_composite = mf_valid.sum(axis=1)
     scores['magic_formula_score'] = rank_series(mf_composite, ascending=False)
 
-    # PE Score (ascending is better so rank ascending)
+    # PE Rank - ascending (lower better)
     if 'pe' in processed.columns:
         scores['pe_rank'] = rank_series(processed['pe'], ascending=True)
     else:
         scores['pe_rank'] = pd.Series(np.nan, index=processed.index)
 
-    # Composite Scores
-    def compute_composite_score(cols, weights, ascending=True):
-        subset = processed[cols]
+    def compute_composite_score(cols, weights):
+        subset = processed[cols].copy()
+
+        # Apply sign inversion for factors that are better ranked ascending
+        for col in cols:
+            if col in invert_factor_signs:
+                subset[col] = -subset[col]
         weighted = weighted_composite_score(subset, weights)
-        return rank_series(weighted, ascending=ascending)
+        # Composite scores typically ranked descending (higher composite better)
+        return rank_series(weighted, ascending=False)
 
     scores['composite_growth_score'] = compute_composite_score(
         composite_weights['composite_growth_score'].keys(),
         composite_weights['composite_growth_score']
     )
-
     scores['composite_strength_score'] = compute_composite_score(
         composite_weights['composite_strength_score'].keys(),
         composite_weights['composite_strength_score']
     )
-
     scores['composite_value_score'] = compute_composite_score(
         composite_weights['composite_value_score'].keys(),
         composite_weights['composite_value_score']
     )
-
     scores['composite_momentum_score'] = compute_composite_score(
         composite_weights['composite_momentum_score'].keys(),
         composite_weights['composite_momentum_score']
     )
-
     scores['fama_french_5_factor_score'] = compute_composite_score(
         composite_weights['fama_french_5_factor_score'].keys(),
         composite_weights['fama_french_5_factor_score']
@@ -199,7 +212,6 @@ def generate_scores_only(conn, engine, factor_date, min_unique=5):
 
     combined = pd.DataFrame(scores)
 
-    # Check uniqueness and log for diagnostics
     unique_counts = combined.nunique(dropna=True)
     logging.info(f"Unique counts for factor_date {factor_date}:\n{unique_counts}")
 
@@ -220,7 +232,6 @@ def generate_scores_only(conn, engine, factor_date, min_unique=5):
     logging.info(f"Generated factor scores for {factor_date} with {len(combined)} tickers")
 
     return combined
-
 
 def upsert_dataframe_to_postgres(engine, df, table_name):
     if 'factor_date' not in df.columns:
@@ -248,7 +259,6 @@ def upsert_dataframe_to_postgres(engine, df, table_name):
         conn.close()
     logging.info(f"Upsert completed for {len(melted)} rows into {table_name}.")
 
-
 def process_factor_date(args):
     factor_date, conn_info = args
     engine = create_engine(conn_info['conn_str'])
@@ -261,6 +271,11 @@ def process_factor_date(args):
     )
     conn.set_client_encoding('UTF8')
     try:
+        # Print factor valid counts for diagnostics
+        valid_counts = count_valid_factors_per_date(conn, factor_date)
+        # Just log factor counts, no skipping
+        for factor_name, count in valid_counts:
+            logging.info(f"Factor {factor_name} has {count} valid entries on {factor_date}")
         all_scores = generate_scores_only(conn, engine, factor_date)
         upsert_dataframe_to_postgres(engine, all_scores, 'factor_ranks')
         gc.collect()
@@ -286,8 +301,8 @@ if __name__ == "__main__":
         'host': params['host'],
         'port': params['port']
     }
+    # mode = 'full'  # or 
     mode = decide_mode()
-    # mode = 'full'
     if mode == 'full':
         start_date = date(2005, 1, 1)
         today = datetime.today()
@@ -301,7 +316,7 @@ if __name__ == "__main__":
                 factor_date = futures[future]
                 try:
                     res = future.result()
-                    logging.info(f"Completed {factor_date}: {res[1]} ({res[2]} rows)")
+                    logging.info(f"Completed {factor_date}: {res[1]} ({res[2]})")
                 except Exception as e:
                     logging.error(f"Failed {factor_date}: {e}")
         logging.info("Full rebuild completed.")
@@ -318,7 +333,7 @@ if __name__ == "__main__":
                 factor_date = futures[future]
                 try:
                     res = future.result()
-                    logging.info(f"Completed incremental {factor_date}: {res[1]} ({res[2]} rows)")
+                    logging.info(f"Completed incremental {factor_date}: {res[1]} ({res[2]})")
                 except Exception as e:
                     logging.error(f"Failed incremental {factor_date}: {e}")
         logging.info("Incremental update completed.")
