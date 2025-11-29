@@ -42,7 +42,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1
 RUN python3.10 -m pip install --upgrade pip
 
-RUN R -e "install.packages(c('DBI','RPostgres','dplyr'), repos='https://cloud.r-project.org')"
+RUN R -e "install.packages(c('DBI','RPostgres','dplyr','simfinapi','yaml','telegram.bot','lubridate','data.table','glue','magrittr'), repos='https://cloud.r-project.org')"
 
 COPY --from=builder /wheels /wheels
 COPY requirements.txt .

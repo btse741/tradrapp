@@ -588,7 +588,7 @@ def run_daily_incremental_update(conn, engine, db_params):
 
 if __name__ == "__main__":
     today = datetime.today().date()
-    start = date(2020, 1, 1)
+    start = date(2000, 1, 1)
     end = today
 
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))

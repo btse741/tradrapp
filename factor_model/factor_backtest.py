@@ -113,20 +113,29 @@ def backtest_for_single_factor_date(conn_str, factor_date, quantiles=5):
 
         results = []
         for factor_name in scores_df['strategy_name'].unique():
-            logging.info(f"Processing factor: {factor_name}")
 
             factor_data = scores_df[scores_df['strategy_name'] == factor_name][['ticker', 'score']].dropna()
             factor_data = factor_data.reset_index(drop=True)  # Fix: reset index before assign
 
-            factor_data['ranked_score'] = factor_data['score'].rank(method='first')
-            # Fix: reset index on qcut before assigning
-            quantiles_series = pd.qcut(factor_data['ranked_score'], quantiles,
-                                      labels=range(1, quantiles + 1))
+            factor_data['ranked_score'] = factor_data['score'].rank(method='first').fillna(np.nan)
+
+            # Proceed only if ranked_score has enough unique values
+            if factor_data['ranked_score'].isna().all():
+                logging.warning(f"All ranked scores are NaN for factor {factor_name} at {factor_date}, skipping")
+                continue
+
+            try:
+                quantiles_series = pd.qcut(factor_data['ranked_score'], quantiles, labels=range(1, quantiles + 1), duplicates='drop')
+            except ValueError as e:
+                logging.warning(f"pd.qcut failed for factor {factor_name} at {factor_date} with error: {e}")
+                continue
+
             factor_data['quantile'] = quantiles_series.reset_index(drop=True)
 
             if factor_data['quantile'].nunique() < quantiles:
                 logging.warning(f"Skipping factor {factor_name} {factor_date} due to insufficient quantile variation")
                 continue
+
 
             tickers = factor_data['ticker'].tolist()
             if not tickers:
@@ -242,7 +251,7 @@ if __name__ == '__main__':
 
     mode = decide_mode()
     # For testing, you can force modes here
-    mode = 'full'
+    # mode = 'full'
     today = date.today()
     if mode == 'full':
         start_dt = date(2005, 1, 1)
